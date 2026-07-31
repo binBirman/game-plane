@@ -1,0 +1,20 @@
+[Unit]
+Description=Lobby Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lobby
+Group=lobby
+EnvironmentFile=/etc/lobby/lobby.env
+ExecStart=/usr/local/bin/lobby
+WorkingDirectory=/var/lib/lobby
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
