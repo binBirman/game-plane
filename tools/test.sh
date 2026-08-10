@@ -216,8 +216,8 @@ run_test "POST /api/login (no such user)" 401 \
     -d "{\"username\":\"nonexistent_$$_$(date +%s)\",\"password\":\"x\",\"captcha\":$CAP}"
 
 # ─── 15-22. room + game spawn + WS roundtrip ───────────────────────────
-TOKEN_A=""
-UID_A=""
+TOKEN_A="$token"
+UID_A="$uid"
 TOKEN_B=""
 UID_B=""
 ROOM_ID=""
@@ -247,26 +247,28 @@ else
     echo "  ${R}FAIL${N}"; fail=$((fail+1))
 fi
 
-run_test "POST /api/rooms (create as A)" 201 \
-    -X POST "$BASE/api/rooms" \
-    -H "Authorization: Bearer $token" \
-    -H 'Content-Type: application/json' \
-    -d '{"game_type":"tictactoe"}'
+run_test "POST /api/games (registry)" 200 \
+    -X GET "$BASE/api/games"
 
-room_create_body=$(curl -sS "${CURL_OPTS[@]}" -X POST "$BASE/api/rooms" \
-    -H "Authorization: Bearer $token" \
+room_create_body=$(curl -sS "${CURL_OPTS[@]}" -w "\n%{http_code}" \
+    -X POST "$BASE/api/rooms" \
+    -H "Authorization: Bearer $TOKEN_A" \
     -H 'Content-Type: application/json' \
-    -d '{"game_type":"tictactoe"}')
-ROOM_ID=$(echo "$room_create_body" | python3 -c "import sys,json; print(json.load(sys.stdin).get('room_id',''))" 2>/dev/null || echo "")
+    -d '{"game_type":"tictactoe"}' 2>&1) || room_create_body="<error>"
+room_create_status=$(echo "$room_create_body" | tail -1)
+room_create_json=$(echo "$room_create_body" | sed '$d')
+ROOM_ID=$(echo "$room_create_json" | python3 -c "import sys,json; print(json.load(sys.stdin).get('room_id',''))" 2>/dev/null || echo "")
 
 total=$((total+1))
 echo
-echo "${B}─── Test $total: capture room_id ───${N}"
-echo "  ${D}room_id:${N} ${ROOM_ID:-<none>}"
-if [[ -n "$ROOM_ID" && "$ROOM_ID" =~ ^[0-9]+$ ]]; then
+echo "${B}─── Test $total: POST /api/rooms (create as A) ───${N}"
+echo "  ${D}status  :${N} $room_create_status"
+echo "  ${D}body    :${N} $room_create_json"
+echo "  ${D}room_id :${N} ${ROOM_ID:-<none>}"
+if [[ "$room_create_status" == "201" && -n "$ROOM_ID" && "$ROOM_ID" =~ ^[0-9]+$ ]]; then
     echo "  ${G}PASS${N}"; pass=$((pass+1))
 else
-    echo "  ${R}FAIL${N}"; fail=$((fail+1))
+    echo "  ${R}FAIL (expected 201 + numeric room_id)${N}"; fail=$((fail+1))
 fi
 
 run_test "POST /api/rooms/$ROOM_ID/join (as B)" 200 \
@@ -275,18 +277,40 @@ run_test "POST /api/rooms/$ROOM_ID/join (as B)" 200 \
     -H 'Content-Type: application/json' \
     -d '{}'
 
-run_test "POST /api/rooms/$ROOM_ID/start (as A)" 200 \
-    -X POST "$BASE/api/rooms/$ROOM_ID/start" \
-    -H "Authorization: Bearer $token" \
+run_test "POST /api/rooms/$ROOM_ID/leave (as B, before start)" 200 \
+    -X POST "$BASE/api/rooms/$ROOM_ID/leave" \
+    -H "Authorization: Bearer $TOKEN_B" \
     -H 'Content-Type: application/json' \
     -d '{}'
 
-start_body=$(curl -sS "${CURL_OPTS[@]}" -X POST "$BASE/api/rooms/$ROOM_ID/start" \
-    -H "Authorization: Bearer $token" \
+# Re-join for the WS roundtrip test.
+ensure_captcha
+curl -sS "${CURL_OPTS[@]}" -X POST "$BASE/api/rooms/$ROOM_ID/join" \
+    -H "Authorization: Bearer $TOKEN_B" \
     -H 'Content-Type: application/json' \
-    -d '{}')
-INSTANCE_ID=$(echo "$start_body" | python3 -c "import sys,json; print(json.load(sys.stdin).get('instance_id',''))" 2>/dev/null || echo "")
-WS_URL=$(echo "$start_body" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ws_url',''))" 2>/dev/null || echo "")
+    -d '{}' >/dev/null
+
+start_body=$(curl -sS "${CURL_OPTS[@]}" -w "\n%{http_code}" \
+    -X POST "$BASE/api/rooms/$ROOM_ID/start" \
+    -H "Authorization: Bearer $TOKEN_A" \
+    -H 'Content-Type: application/json' \
+    -d '{}' 2>&1) || start_body="<error>"
+start_status=$(echo "$start_body" | tail -1)
+start_json=$(echo "$start_body" | sed '$d')
+
+total=$((total+1))
+echo
+echo "${B}─── Test $total: POST /api/rooms/$ROOM_ID/start ───${N}"
+echo "  ${D}status    :${N} $start_status"
+echo "  ${D}body      :${N} $start_json"
+if [[ "$start_status" == "200" ]]; then
+    echo "  ${G}PASS${N}"; pass=$((pass+1))
+else
+    echo "  ${R}FAIL (expected 200)${N}"; fail=$((fail+1))
+fi
+
+INSTANCE_ID=$(echo "$start_json" | python3 -c "import sys,json; print(json.load(sys.stdin).get('instance_id',''))" 2>/dev/null || echo "")
+WS_URL=$(echo "$start_json" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ws_url',''))" 2>/dev/null || echo "")
 
 total=$((total+1))
 echo
@@ -300,49 +324,52 @@ else
 fi
 
 # WS roundtrip via tools/ws_client.py
-if [[ -n "$INSTANCE_ID" && -n "$token" ]]; then
+if [[ -n "$INSTANCE_ID" && -n "$TOKEN_A" ]]; then
     total=$((total+1))
     echo
     echo "${B}─── Test $total: WS roundtrip (login + snapshot + move) ───${N}"
     SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-    ws_out=$(python3 - "$HOST" "$PORT" "$INSTANCE_ID" "$token" "$UID_A" <<'PYEOF'
-import sys
-sys.path.insert(0, sys.argv[0] and "" or ".")
-sys.path.insert(0, "$SCRIPT_DIR")
+    export SCRIPT_DIR HOST PORT INSTANCE_ID TOKEN_A UID_A
+    ws_out=$(cd "$SCRIPT_DIR" && python3 -c "
+import sys, os
+sys.path.insert(0, os.environ['SCRIPT_DIR'])
 from ws_client import handshake, send_text, recv_text
 
-host, port, instance_id, token, uid_a = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
+host = os.environ['HOST']
+port = int(os.environ['PORT'])
+instance_id = os.environ['INSTANCE_ID']
+token = os.environ['TOKEN_A']
+uid_a = int(os.environ['UID_A'])
 
 try:
-    sock = handshake(host, port, "/ws/" + instance_id)
+    sock = handshake(host, port, '/ws/' + instance_id)
 except Exception as e:
-    print("HANDSHAKE_FAIL:" + str(e))
+    print('HANDSHAKE_FAIL:' + str(e))
     sys.exit(1)
 
 try:
-    send_text(sock, '{"type":"login","uid":' + str(uid_a) + ',"session":"' + token + '"}')
+    send_text(sock, '{\"type\":\"login\",\"uid\":' + str(uid_a) + ',\"session\":\"' + token + '\"}')
     f1 = recv_text(sock)
     f2 = recv_text(sock)
     if not f1 or 'login_ok' not in f1:
-        print("LOGIN_FAIL:" + (f1 or "<none>"))
+        print('LOGIN_FAIL:' + (f1 or '<none>'))
         sys.exit(2)
     if not f2 or 'snapshot' not in f2:
-        print("SNAPSHOT_FAIL:" + (f2 or "<none>"))
+        print('SNAPSHOT_FAIL:' + (f2 or '<none>'))
         sys.exit(3)
-    send_text(sock, '{"type":"game","data":{"action":"move","cell":0}}')
+    send_text(sock, '{\"type\":\"game\",\"data\":{\"action\":\"move\",\"cell\":0}}')
     f3 = recv_text(sock)
-    if not f3 or 'game' not in f3:
-        print("MOVE_FAIL:" + (f3 or "<none>"))
+    if not f3 or 'snapshot' not in f3:
+        print('MOVE_FAIL:' + (f3 or '<none>'))
         sys.exit(4)
-    print("OK")
+    print('OK')
 except Exception as e:
-    print("ERR:" + str(e))
+    print('ERR:' + str(e))
     sys.exit(5)
 finally:
     try: sock.close()
     except: pass
-PYEOF
-    )
+")
     if [[ "$ws_out" == "OK" ]]; then
         echo "  ${D}handshake+login+snapshot+move all OK${N}"
         echo "  ${G}PASS${N}"; pass=$((pass+1))
@@ -355,7 +382,7 @@ fi
 # Cleanup: A leaves, then B leaves
 run_test "POST /api/rooms/$ROOM_ID/leave (A)" 200 \
     -X POST "$BASE/api/rooms/$ROOM_ID/leave" \
-    -H "Authorization: Bearer $token" \
+    -H "Authorization: Bearer $TOKEN_A" \
     -H 'Content-Type: application/json' \
     -d '{}'
 

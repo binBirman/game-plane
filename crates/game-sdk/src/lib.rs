@@ -21,6 +21,19 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
+/// Initialize tracing for a game binary. Output goes to stderr so stdout
+/// stays clean for the JSON line protocol that Lobby reads.
+pub fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+}
+
 /// 当前阶段信息（推送给客户端，供 UI 展示）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PhaseInfo {
@@ -163,6 +176,7 @@ enum ServerMsg {
     #[serde(rename = "pong")]
     Pong,
     #[serde(rename = "game")]
+    #[allow(dead_code)]
     Game { data: Value },
     #[serde(rename = "game_error")]
     GameError { code: String, message: String },
@@ -213,13 +227,16 @@ async fn handle_socket<L: GameLogic>(
     let (mut sender, mut receiver) = socket.split();
 
     // First frame: login or reconnect
-    let uid = loop {
+    let mut uid: i64 = 0;
+    let mut authed = false;
+    while !authed {
         match receiver.next().await {
             Some(Ok(Message::Text(t))) => match serde_json::from_str::<ClientMsg>(&t) {
-                Ok(ClientMsg::Login { uid, session }) => {
-                    let valid = logic.lock().await.validate_session(uid, &session);
+                Ok(ClientMsg::Login { uid: u, session }) => {
+                    let valid = logic.lock().await.validate_session(u, &session);
                     if valid {
-                        break uid;
+                        uid = u;
+                        authed = true;
                     } else {
                         let _ = send_err(
                             &mut sender,
@@ -230,10 +247,11 @@ async fn handle_socket<L: GameLogic>(
                         return;
                     }
                 }
-                Ok(ClientMsg::Reconnect { uid, session }) => {
-                    let valid = logic.lock().await.validate_session(uid, &session);
+                Ok(ClientMsg::Reconnect { uid: u, session }) => {
+                    let valid = logic.lock().await.validate_session(u, &session);
                     if valid {
-                        break uid;
+                        uid = u;
+                        authed = true;
                     } else {
                         let _ = send_err(
                             &mut sender,
@@ -256,7 +274,7 @@ async fn handle_socket<L: GameLogic>(
             },
             _ => return,
         }
-    };
+    }
 
     // Register this connection's outbound channel
     let (tx, mut rx) = mpsc::channel::<ServerMsg>(16);
@@ -294,7 +312,7 @@ async fn handle_socket<L: GameLogic>(
     });
 
     // Inbound loop
-    let mut game_over = false;
+    let game_over = false;
     while let Some(Ok(msg)) = receiver.next().await {
         match msg {
             Message::Text(t) => match serde_json::from_str::<ClientMsg>(&t) {
@@ -319,7 +337,7 @@ async fn handle_socket<L: GameLogic>(
                                 .await;
                         }
                         ActionOutcome::GameOver => {
-                            game_over = true;
+                            let _ = game_over; // suppress unused_assignments (loop exits via `break`)
                             println!("{{\"event\":\"finished\"}}");
                             broadcast_snapshot(&logic, &registry).await;
                             break;
@@ -327,8 +345,8 @@ async fn handle_socket<L: GameLogic>(
                     }
                     // Check game-over signal from logic itself
                     let over = logic.lock().await.is_over();
-                    if over && !game_over {
-                        game_over = true;
+                    if over {
+                        let _ = game_over;
                         println!("{{\"event\":\"finished\"}}");
                         broadcast_snapshot(&logic, &registry).await;
                         break;
@@ -368,8 +386,8 @@ async fn broadcast_snapshot<L: GameLogic>(
     let pending: Vec<(i64, Value)> = {
         let g = logic.lock().await;
         let r = registry.lock().await;
-        r.iter()
-            .map(|(uid, _)| (*uid, g.snapshot(Some(*uid))))
+        r.keys()
+            .map(|uid| (*uid, g.snapshot(Some(*uid))))
             .collect()
     };
     for (uid, snap) in pending {
@@ -384,11 +402,11 @@ async fn send_msg(
     msg: &ServerMsg,
 ) -> Result<(), axum::Error> {
     let text = serde_json::to_string(msg)
-        .map_err(|e| axum::Error::new(e))?;
+        .map_err(axum::Error::new)?;
     sender
         .send(Message::Text(text))
         .await
-        .map_err(|e| axum::Error::new(e))
+        .map_err(axum::Error::new)
 }
 
 async fn send_err(

@@ -1,80 +1,53 @@
-# lobby-server install package
+# lobby-server 安装包
 
-Linux x86_64 install of the Lobby server (static musl binary).
+Linux x86_64 musl 静态安装。详细文档请看仓库根目录的 [`README.md`](../README.md)。
 
-## Files
+## 文件
 
-| File | Purpose |
+| 文件 | 用途 |
 |---|---|
-| `lobby` | static binary (musl, no runtime deps) |
+| `lobby` | 静态二进制（musl，无运行时依赖） |
+| `tictactoe` | 默认游戏二进制 |
 | `lobby.service` | systemd unit |
-| `lobby.env.example` | config template |
-| `install.sh` | privileged installer |
-| `uninstall.sh` | privileged remover |
+| `lobby.env.example` | 环境变量模板 |
+| `games.toml` | 游戏注册表 |
+| `nginx.conf.example` | nginx 反代参考配置 |
+| `RUNBOOK.md` | 运维手册（systemd、nginx、certbot、备份、升级、添加游戏） |
+| `install.sh` | 提权安装器 |
+| `uninstall.sh` | 提权卸载器 |
 
-## Install
+## 安装
 
 ```bash
 sudo ./install.sh
-sudo systemctl edit lobby   # optional overrides
+sudo systemctl edit lobby    # 可选：drop-in 覆盖
 sudo systemctl start lobby
 sudo systemctl status lobby
 ```
 
-The installer:
+安装器会：
 
-- creates system user `lobby`
-- installs binary to `/usr/local/bin/lobby`
-- creates `/var/lib/lobby` (sqlite data) and `/var/log/lobby` (logs)
-- writes `/etc/lobby/lobby.env` from the example (edit before starting)
-- enables the systemd service (does **not** start it)
+- 创建 system user `lobby`
+- 拷二进制到 `/usr/local/bin/{lobby,tictactoe}`
+- 创建 `/var/lib/lobby`（SQLite 数据）+ `/var/log/lobby`（滚动日志）
+- 从 `lobby.env.example` 写入 `/etc/lobby/lobby.env`（不会覆盖已有）
+- 拷 `games.toml` 到 `/etc/lobby/games.toml`（不会覆盖已有）
+- 注册并启用 systemd 服务（**不自动启动**）
+- 若 nginx 已装：丢 `nginx.conf.example` 到 `/etc/nginx/sites-available/lobby`（不自动启用）
 
-## Configure
-
-Edit `/etc/lobby/lobby.env`:
-
-| Var | Default | Notes |
-|---|---|---|
-| `LOBBY_BIND` | `0.0.0.0:8192` | listen address |
-| `LOBBY_DATABASE_URL` | `sqlite:///var/lib/lobby/lobby.db?mode=rwc` | sqlite path |
-| `LOBBY_SESSION_TTL_DAYS` | `7` | session expiry |
-| `LOBBY_LOG_FORMAT` | `json` | `text` or `json` |
-| `LOBBY_LOG_FILE_DIR` | `/var/log/lobby` | unset to log to stdout only |
-| `LOBBY_LOG_KEEP_DAYS` | `14` | old files pruned on startup |
-| `RUST_LOG` | `info,lobby::http=debug` | env-filter syntax |
-
-Reload after editing: `sudo systemctl restart lobby`.
-
-## Logs
-
-- **journald (always on)**: `journalctl -u lobby -f`
-- **rolling files** (when `LOBBY_LOG_FILE_DIR` set): `/var/log/lobby/lobby.YYYY-MM-DD.log`
-- **HTTP correlation**: every response carries `x-request-id`; the same id appears in both stdout and file logs as the span field `request_id`.
-
-## Smoke test
-
-```bash
-curl --noproxy '*' -X POST http://127.0.0.1:8192/api/register \
-  -H 'Content-Type: application/json' \
-  -d '{"username":"alice","password":"secret123","nickname":"Alice"}'
-
-curl --noproxy '*' -X POST http://127.0.0.1:8192/api/login \
-  -H 'Content-Type: application/json' \
-  -d '{"username":"alice","password":"secret123"}'
-```
-
-Or use the bundled `tools/test.sh` (10+ test cases with pass/fail summary).
-
-Expected: `{"uid":1,...}` and `{"uid":1,"token":"<64hex>"}`.
-
-## Uninstall
+## 卸载
 
 ```bash
 sudo ./uninstall.sh
 ```
 
-Preserves `/var/lib/lobby` and `/var/log/lobby`; remove manually if desired.
+保留 `/var/lib/lobby` 和 `/var/log/lobby`，需要时手动清理：
 
-## Firewall
+```bash
+sudo rm -rf /var/lib/lobby /var/log/lobby
+sudo userdel lobby
+```
 
-V1 uses **reverse proxy**: the client connects to the Lobby's WS endpoint on the bind port only. Game instances bind `127.0.0.1` and are not reachable from outside — no extra ports to open.
+## 防火墙
+
+V1 反代：客户端只连 Lobby 单一公开端口；game 进程绑 `127.0.0.1`，对外不可见——**不要再额外开 game 端口**。

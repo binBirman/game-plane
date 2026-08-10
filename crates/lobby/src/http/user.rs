@@ -1,8 +1,9 @@
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use tracing::Instrument;
 
 use crate::auth::{password, pow, session};
@@ -31,11 +32,16 @@ pub struct RegisterResp {
 
 pub async fn register(
     State(state): State<SharedState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(req): Json<RegisterReq>,
 ) -> Result<impl IntoResponse, ApiError> {
     let span = tracing::info_span!("register", username = %req.username, nickname = %req.nickname);
 
     async move {
+        if !state.rl_register.check(addr.ip()).await {
+            tracing::warn!("rate limited");
+            return Err(ApiError::RateLimited);
+        }
         let cap = req.captcha.as_ref().ok_or(ApiError::CaptchaRequired)?;
         if !pow::verify(&cap.challenge, &cap.nonce, state.pow_difficulty) {
             tracing::warn!("captcha invalid");
@@ -100,11 +106,16 @@ pub struct LoginResp {
 
 pub async fn login(
     State(state): State<SharedState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(req): Json<LoginReq>,
 ) -> Result<Json<LoginResp>, ApiError> {
     let span = tracing::info_span!("login", username = %req.username);
 
     async move {
+        if !state.rl_login.check(addr.ip()).await {
+            tracing::warn!("rate limited");
+            return Err(ApiError::RateLimited);
+        }
         let cap = req.captcha.as_ref().ok_or(ApiError::CaptchaRequired)?;
         if !pow::verify(&cap.challenge, &cap.nonce, state.pow_difficulty) {
             tracing::warn!("captcha invalid");

@@ -8,9 +8,12 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
+
+const READY_TIMEOUT: Duration = Duration::from_secs(10);
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -23,6 +26,7 @@ pub enum Status {
 }
 
 impl Status {
+    #[allow(dead_code)]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Starting => "starting",
@@ -43,7 +47,7 @@ pub enum GameEvent {
     #[serde(rename = "running")]
     Running,
     #[serde(rename = "finished")]
-    Finished,
+    Finished { #[serde(default)] result: serde_json::Value },
     #[serde(rename = "shutdown")]
     Shutdown,
     #[serde(rename = "heartbeat")]
@@ -60,24 +64,26 @@ pub enum GameCommand {
 }
 
 struct ActiveInstance {
+    room_id: i64,
     port: u16,
-    #[allow(dead_code)]
     status: Status,
     last_heartbeat: Instant,
     stdin_tx: mpsc::Sender<String>,
+    child: Arc<Mutex<Option<Child>>>,
 }
 
 pub struct InstanceManager {
     db: SqlitePool,
-    bin_path: PathBuf,
+    #[allow(dead_code)]
+    default_bin: PathBuf,
     instances: Arc<Mutex<HashMap<i64, ActiveInstance>>>,
 }
 
 impl InstanceManager {
-    pub fn new(db: SqlitePool, bin_path: PathBuf) -> Self {
+    pub fn new(db: SqlitePool, default_bin: PathBuf) -> Self {
         Self {
             db,
-            bin_path,
+            default_bin,
             instances: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -86,6 +92,8 @@ impl InstanceManager {
         self: &Arc<Self>,
         room_id: i64,
         game_type: &str,
+        bin: &std::path::Path,
+        init_config: Option<serde_json::Value>,
         players: Vec<(i64, String)>,
     ) -> Result<i64> {
         let port = allocate_port().await?;
@@ -97,16 +105,17 @@ impl InstanceManager {
             "players": players.iter().map(|(uid, session)| {
                 serde_json::json!({"uid": uid, "session": session})
             }).collect::<Vec<_>>(),
+            "config": init_config,
         });
         let init_line = format!("{}\n", init_payload);
 
-        let mut child = Command::new(&self.bin_path)
+        let mut child = Command::new(bin)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .with_context(|| format!("spawn {}", self.bin_path.display()))?;
+            .with_context(|| format!("spawn {}", bin.display()))?;
 
         let pid = child.id();
         let mut stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
@@ -127,7 +136,6 @@ impl InstanceManager {
         .map_err(|e| anyhow!("db insert instance: {e}"))?;
         let instance_id = row.0;
 
-        // stdin writer task
         let (stdin_tx, mut stdin_rx) = mpsc::channel::<String>(16);
         tokio::spawn(async move {
             while let Some(line) = stdin_rx.recv().await {
@@ -143,7 +151,6 @@ impl InstanceManager {
             }
         });
 
-        // stderr → log
         tokio::spawn(async move {
             let mut reader = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = reader.next_line().await {
@@ -151,22 +158,31 @@ impl InstanceManager {
             }
         });
 
-        // stdout event reader
+        let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(Some(child)));
+
         let db = self.db.clone();
         let instances = self.instances.clone();
+        let child_for_reader = child_slot.clone();
+        let stdin_tx_for_reader = stdin_tx.clone();
         tokio::spawn(async move {
             let mut reader = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = reader.next_line().await {
                 let evt: serde_json::Result<GameEvent> = serde_json::from_str(&line);
                 let mut g = instances.lock().await;
                 match evt {
-                    Ok(GameEvent::Ready { .. }) => {
-                        info!(instance_id, "game ready");
+                    Ok(GameEvent::Ready { port: ready_port }) => {
+                        info!(instance_id, ?ready_port, "game ready");
                         if let Some(h) = g.get_mut(&instance_id) {
                             h.status = Status::Ready;
                         }
                         let _ = sqlx::query("UPDATE game_instances SET status='ready' WHERE instance_id=?")
                             .bind(instance_id).execute(&db).await;
+                        let _ = sqlx::query("UPDATE rooms SET status='Running' WHERE room_id=?")
+                            .bind(h_room_id(&g, instance_id)).execute(&db).await;
+                        // Notify game it can formally start the match.
+                        let _ = stdin_tx_for_reader
+                            .send(serde_json::to_string(&GameCommand::Start).unwrap())
+                            .await;
                     }
                     Ok(GameEvent::Running) => {
                         info!(instance_id, "game running");
@@ -176,13 +192,23 @@ impl InstanceManager {
                         let _ = sqlx::query("UPDATE game_instances SET status='running' WHERE instance_id=?")
                             .bind(instance_id).execute(&db).await;
                     }
-                    Ok(GameEvent::Finished) => {
-                        info!(instance_id, "game finished");
+                    Ok(GameEvent::Finished { result }) => {
+                        info!(instance_id, ?result, "game finished");
                         if let Some(h) = g.get_mut(&instance_id) {
                             h.status = Status::Finished;
                         }
-                        let _ = sqlx::query("UPDATE game_instances SET status='finished' WHERE instance_id=?")
+                        let _ = sqlx::query("UPDATE game_instances SET status='finished', end_time=datetime('now') WHERE instance_id=?")
                             .bind(instance_id).execute(&db).await;
+                        let _ = sqlx::query("UPDATE rooms SET status='Finished' WHERE room_id=?")
+                            .bind(h_room_id(&g, instance_id)).execute(&db).await;
+                        // Reap child + drop instance record.
+                        drop(g);
+                        if let Some(mut c) = child_for_reader.lock().await.take() {
+                            let _ = c.start_kill();
+                            let _ = c.wait().await;
+                        }
+                        instances.lock().await.remove(&instance_id);
+                        return;
                     }
                     Ok(GameEvent::Shutdown) => {
                         info!(instance_id, "game shutdown");
@@ -201,22 +227,63 @@ impl InstanceManager {
                 }
                 drop(g);
             }
-            // stdout closed: abnormal if still active
+            // stdout closed
             let mut g = instances.lock().await;
             if let Some(h) = g.get_mut(&instance_id) {
                 if !matches!(h.status, Status::Stopped | Status::Finished | Status::Abnormal) {
                     h.status = Status::Abnormal;
+                    let room = h.room_id;
                     let _ = sqlx::query("UPDATE game_instances SET status='abnormal', end_time=datetime('now') WHERE instance_id=?")
                         .bind(instance_id).execute(&db).await;
+                    let _ = sqlx::query("UPDATE rooms SET status='Waiting' WHERE room_id=?")
+                        .bind(room).execute(&db).await;
                 }
             }
         });
 
+        let child_for_store = child_slot.clone();
         self.instances.lock().await.insert(instance_id, ActiveInstance {
+            room_id,
             port,
             status: Status::Starting,
             last_heartbeat: Instant::now(),
             stdin_tx,
+            child: child_for_store,
+        });
+
+        // Spawn timeout watchdog for this instance (10s to reach ready).
+        let instances_wd = self.instances.clone();
+        let db_wd = self.db.clone();
+        let child_wd = child_slot.clone();
+        let stdin_tx_wd = self.instances.clone(); // unused below; ref only
+        let _ = stdin_tx_wd;
+        tokio::spawn(async move {
+            let start = Instant::now();
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let mut g = instances_wd.lock().await;
+                let Some(h) = g.get_mut(&instance_id) else { return; };
+                if matches!(h.status, Status::Ready | Status::Running | Status::Finished | Status::Stopped | Status::Abnormal) {
+                    return;
+                }
+                if start.elapsed() > READY_TIMEOUT {
+                    warn!(instance_id, "ready timeout, killing");
+                    h.status = Status::Abnormal;
+                    let room = h.room_id;
+                    let _ = sqlx::query("UPDATE game_instances SET status='abnormal', end_time=datetime('now') WHERE instance_id=?")
+                        .bind(instance_id).execute(&db_wd).await;
+                    let _ = sqlx::query("UPDATE rooms SET status='Waiting' WHERE room_id=?")
+                        .bind(room).execute(&db_wd).await;
+                    drop(g);
+                    if let Some(mut c) = child_wd.lock().await.take() {
+                        let _ = c.start_kill();
+                        let _ = c.wait().await;
+                    }
+                    instances_wd.lock().await.remove(&instance_id);
+                    return;
+                }
+                drop(g);
+            }
         });
 
         Ok(instance_id)
@@ -227,24 +294,51 @@ impl InstanceManager {
         g.get(&instance_id).map(|h| (h.port, h.status))
     }
 
+    /// Gracefully stop one instance: send cmd:stop, wait up to SHUTDOWN_GRACE, then kill.
     pub async fn stop(&self, instance_id: i64, reason: &str) {
         let mut g = self.instances.lock().await;
-        if let Some(h) = g.get_mut(&instance_id) {
-            let line = serde_json::to_string(&GameCommand::Stop { reason: reason.into() }).unwrap();
-            let _ = h.stdin_tx.send(line).await;
-            h.status = Status::Stopped;
+        let Some(h) = g.get_mut(&instance_id) else { return; };
+        let line = serde_json::to_string(&GameCommand::Stop { reason: reason.into() }).unwrap();
+        let _ = h.stdin_tx.send(line).await;
+        let child = h.child.clone();
+        let room_id = h.room_id;
+        h.status = Status::Stopped;
+        drop(g);
+
+        let deadline = Instant::now() + SHUTDOWN_GRACE;
+        loop {
+            let mut g = self.instances.lock().await;
+            if !g.contains_key(&instance_id) {
+                return;
+            }
+            if Instant::now() >= deadline {
+                warn!(instance_id, "graceful shutdown timeout, force-killing");
+                if let Some(mut c) = child.lock().await.take() {
+                    let _ = c.start_kill();
+                    let _ = c.wait().await;
+                }
+                g.remove(&instance_id);
+                let _ = sqlx::query("UPDATE game_instances SET status='stopped', end_time=datetime('now') WHERE instance_id=?")
+                    .bind(instance_id).execute(&self.db).await;
+                let _ = sqlx::query("UPDATE rooms SET status='Destroyed' WHERE room_id=?")
+                    .bind(room_id).execute(&self.db).await;
+                return;
+            }
+            drop(g);
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
 
+    #[allow(dead_code)]
     pub async fn send_start(&self, instance_id: i64) {
-        let mut g = self.instances.lock().await;
-        if let Some(h) = g.get_mut(&instance_id) {
+        let g = self.instances.lock().await;
+        if let Some(h) = g.get(&instance_id) {
             let line = serde_json::to_string(&GameCommand::Start).unwrap();
             let _ = h.stdin_tx.send(line).await;
         }
     }
 
-    /// Run watchdog: mark abnormal any instance without heartbeat for >15s.
+    /// Mark abnormal any instance without heartbeat for >15s.
     pub async fn check_timeouts(&self) -> Vec<i64> {
         let mut timed_out = Vec::new();
         let mut g = self.instances.lock().await;
@@ -255,13 +349,28 @@ impl InstanceManager {
             if h.last_heartbeat.elapsed() > Duration::from_secs(15) {
                 warn!(instance_id = id, "heartbeat timeout");
                 h.status = Status::Abnormal;
+                let room = h.room_id;
                 let _ = sqlx::query("UPDATE game_instances SET status='abnormal', end_time=datetime('now') WHERE instance_id=?")
                     .bind(id).execute(&self.db).await;
+                let _ = sqlx::query("UPDATE rooms SET status='Waiting' WHERE room_id=?")
+                    .bind(room).execute(&self.db).await;
                 timed_out.push(*id);
             }
         }
         timed_out
     }
+
+    /// Iterate active instances; stop everything (called on SIGTERM).
+    pub async fn shutdown_all(&self) {
+        let ids: Vec<i64> = self.instances.lock().await.keys().copied().collect();
+        for id in ids {
+            self.stop(id, "lobby_shutdown").await;
+        }
+    }
+}
+
+fn h_room_id(map: &HashMap<i64, ActiveInstance>, instance_id: i64) -> i64 {
+    map.get(&instance_id).map(|h| h.room_id).unwrap_or(0)
 }
 
 async fn allocate_port() -> Result<u16> {

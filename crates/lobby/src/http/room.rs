@@ -6,14 +6,17 @@ use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
 use crate::auth::extractor::CurrentUser;
+use crate::games::registry::public_view;
 use crate::http::error::ApiError;
 use crate::state::SharedState;
-
-const SUPPORTED_GAMES: &[&str] = &["tictactoe"];
 
 #[derive(Debug, Deserialize)]
 pub struct CreateReq {
     pub game_type: String,
+    #[serde(default)]
+    pub variant: Option<String>,
+    #[serde(default)]
+    pub config: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -29,7 +32,15 @@ pub struct RoomInfo {
     pub game_type: String,
     pub host_uid: i64,
     pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
     pub players: Vec<PlayerInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_instance_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_players: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_players: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -43,21 +54,41 @@ pub async fn create(
     user: CurrentUser,
     Json(req): Json<CreateReq>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let span = tracing::info_span!("room.create", game_type = %req.game_type, uid = user.uid);
+    let span = tracing::info_span!(
+        "room.create",
+        game_type = %req.game_type,
+        uid = user.uid
+    );
 
     async move {
-        if !SUPPORTED_GAMES.contains(&req.game_type.as_str()) {
-            tracing::warn!("unsupported game_type");
-            return Err(ApiError::GameTypeUnsupported(req.game_type));
+        let entry = state
+            .games
+            .get(&req.game_type)
+            .ok_or_else(|| ApiError::GameTypeUnsupported(req.game_type.clone()))?;
+
+        if let Some(v) = &req.variant {
+            if !entry.variants.is_empty() && !entry.variants.iter().any(|x| x == v) {
+                return Err(ApiError::InvalidParams(format!(
+                    "unknown variant '{}' for game_type '{}'",
+                    v, req.game_type
+                )));
+            }
         }
+
+        let config_str = match &req.config {
+            Some(v) => Some(serde_json::to_string(v).map_err(|e| ApiError::Internal(e.into()))?),
+            None => None,
+        };
 
         let mut tx = state.db.begin().await.map_err(|e| ApiError::Internal(e.into()))?;
 
         let row: (i64,) = sqlx::query_as(
-            "INSERT INTO rooms (game_type, host_uid, status) VALUES (?, ?, 'Waiting') RETURNING room_id",
+            "INSERT INTO rooms (game_type, host_uid, status, variant, config) VALUES (?, ?, 'Waiting', ?, ?) RETURNING room_id",
         )
         .bind(&req.game_type)
         .bind(user.uid)
+        .bind(&req.variant)
+        .bind(&config_str)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| ApiError::Internal(e.into()))?;
@@ -88,23 +119,38 @@ pub async fn get(
     Path(room_id): Path<i64>,
 ) -> Result<Json<RoomInfo>, ApiError> {
     let span = tracing::info_span!("room.get", room_id);
+    let db = state.db.clone();
 
     async move {
-        let row: Option<(String, i64, String)> = sqlx::query_as(
-            "SELECT game_type, host_uid, status FROM rooms WHERE room_id = ?",
+        let row: Option<(String, i64, String, Option<String>)> = sqlx::query_as(
+            "SELECT game_type, host_uid, status, variant FROM rooms WHERE room_id = ?",
         )
         .bind(room_id)
-        .fetch_optional(&state.db)
+        .fetch_optional(&db)
         .await
         .map_err(|e| ApiError::Internal(e.into()))?;
 
-        let (game_type, host_uid, status) = row.ok_or(ApiError::RoomNotFound)?;
+        let (game_type, host_uid, status, variant) = row.ok_or(ApiError::RoomNotFound)?;
+        let entry = state.games.get(&game_type);
+        let (min_players, max_players) = entry
+            .map(|e| (Some(e.min_players), Some(e.max_players)))
+            .unwrap_or((None, None));
 
         let players: Vec<(i64, String, i32)> = sqlx::query_as(
             "SELECT u.id, u.nickname, rp.seat FROM room_players rp JOIN users u ON u.id = rp.uid WHERE rp.room_id = ? ORDER BY rp.seat",
         )
         .bind(room_id)
-        .fetch_all(&state.db)
+        .fetch_all(&db)
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+
+        // Latest instance id (any active or most-recent finished one).
+        let current_instance_id: Option<i64> = sqlx::query_scalar(
+            "SELECT instance_id FROM game_instances WHERE room_id = ? \
+             ORDER BY instance_id DESC LIMIT 1",
+        )
+        .bind(room_id)
+        .fetch_optional(&db)
         .await
         .map_err(|e| ApiError::Internal(e.into()))?;
 
@@ -113,7 +159,11 @@ pub async fn get(
             game_type,
             host_uid,
             status,
+            variant,
             players: players.into_iter().map(|(uid, nickname, seat)| PlayerInfo { uid, nickname, seat }).collect(),
+            current_instance_id,
+            min_players,
+            max_players,
         }))
     }
     .instrument(span)
@@ -130,25 +180,27 @@ pub async fn join(
     async move {
         let mut tx = state.db.begin().await.map_err(|e| ApiError::Internal(e.into()))?;
 
-        let row: Option<(String, i64, String)> = sqlx::query_as(
-            "SELECT game_type, host_uid, status FROM rooms WHERE room_id = ?",
+        let row: Option<(String, i64, String, Option<String>)> = sqlx::query_as(
+            "SELECT game_type, host_uid, status, variant FROM rooms WHERE room_id = ?",
         )
         .bind(room_id)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| ApiError::Internal(e.into()))?;
-        let (game_type, host_uid, status) = row.ok_or(ApiError::RoomNotFound)?;
+        let (game_type, host_uid, status, variant) = row.ok_or(ApiError::RoomNotFound)?;
 
         if status != "Waiting" {
             return Err(ApiError::RoomNotWaiting);
         }
+
+        let max_p = state.games.get(&game_type).map(|e| e.max_players).unwrap_or(2);
 
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM room_players WHERE room_id = ?")
             .bind(room_id)
             .fetch_one(&mut *tx)
             .await
             .map_err(|e| ApiError::Internal(e.into()))?;
-        if count.0 >= 2 {
+        if count.0 as usize >= max_p {
             return Err(ApiError::RoomFull);
         }
 
@@ -162,9 +214,21 @@ pub async fn join(
             return Err(ApiError::AlreadyInRoom);
         }
 
-        sqlx::query("INSERT INTO room_players (room_id, uid, seat) VALUES (?, ?, 1)")
+        // seat = next free index in [0..max_p)
+        let taken: Vec<(i32,)> = sqlx::query_as(
+            "SELECT seat FROM room_players WHERE room_id = ? ORDER BY seat",
+        )
+        .bind(room_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+        let taken: Vec<i32> = taken.into_iter().map(|(s,)| s).collect();
+        let seat = (0..max_p as i32).find(|i| !taken.contains(i)).unwrap_or(0);
+
+        sqlx::query("INSERT INTO room_players (room_id, uid, seat) VALUES (?, ?, ?)")
             .bind(room_id)
             .bind(user.uid)
+            .bind(seat)
             .execute(&mut *tx)
             .await
             .map_err(|e| ApiError::Internal(e.into()))?;
@@ -184,7 +248,11 @@ pub async fn join(
             game_type,
             host_uid,
             status,
+            variant,
             players: players.into_iter().map(|(uid, nickname, seat)| PlayerInfo { uid, nickname, seat }).collect(),
+            current_instance_id: None,
+            min_players: Some(2),
+            max_players: Some(2),
         }))
     }
     .instrument(span)
@@ -210,7 +278,7 @@ pub async fn leave(
             return Err(ApiError::NotInRoom);
         }
 
-        // If room is empty, mark destroyed
+        // If empty, mark destroyed.
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM room_players WHERE room_id = ?")
             .bind(room_id)
             .fetch_one(&state.db)
@@ -235,6 +303,16 @@ pub struct StartResp {
     pub ws_url: String,
 }
 
+#[derive(sqlx::FromRow)]
+struct RoomRowStart {
+    game_type: String,
+    host_uid: i64,
+    status: String,
+    #[allow(dead_code)]
+    variant: Option<String>,
+    config: Option<String>,
+}
+
 pub async fn start(
     State(state): State<SharedState>,
     user: CurrentUser,
@@ -243,25 +321,30 @@ pub async fn start(
     let span = tracing::info_span!("room.start", room_id, uid = user.uid);
 
     async move {
-        // Verify room + host + status
-        let row: Option<(String, i64, String)> = sqlx::query_as(
-            "SELECT game_type, host_uid, status FROM rooms WHERE room_id = ?",
+        let row: Option<RoomRowStart> = sqlx::query_as(
+            "SELECT game_type, host_uid, status, variant, config FROM rooms WHERE room_id = ?",
         )
         .bind(room_id)
         .fetch_optional(&state.db)
         .await
         .map_err(|e| ApiError::Internal(e.into()))?;
-        let (game_type, host_uid, status) = row.ok_or(ApiError::RoomNotFound)?;
+        let RoomRowStart { game_type, host_uid, status, variant: _, config: config_str } =
+            row.ok_or(ApiError::RoomNotFound)?;
 
         if host_uid != user.uid {
             return Err(ApiError::NotHost);
         }
 
-        if status != "Waiting" {
+        // Allow start from Waiting or Finished (replay).
+        if !matches!(status.as_str(), "Waiting" | "Finished") {
             return Err(ApiError::RoomNotWaiting);
         }
 
-        // Verify players count
+        let entry = state
+            .games
+            .get(&game_type)
+            .ok_or_else(|| ApiError::GameTypeUnsupported(game_type.clone()))?;
+
         let players: Vec<(i64, String)> = sqlx::query_as(
             "SELECT rp.uid, s.token FROM room_players rp JOIN sessions s ON s.user_id = rp.uid WHERE rp.room_id = ?",
         )
@@ -270,8 +353,11 @@ pub async fn start(
         .await
         .map_err(|e| ApiError::Internal(e.into()))?;
 
-        if players.len() < 2 {
+        if players.len() < entry.min_players {
             return Err(ApiError::NotEnoughPlayers);
+        }
+        if players.len() > entry.max_players {
+            return Err(ApiError::RoomFull);
         }
 
         // Mark Starting
@@ -281,17 +367,28 @@ pub async fn start(
             .await
             .map_err(|e| ApiError::Internal(e.into()))?;
 
-        // Spawn Game
+        let init_config = config_str
+            .as_deref()
+            .map(|s| serde_json::from_str(s).unwrap_or(serde_json::Value::Null));
+
         let instance_id = state
             .instances
-            .spawn(room_id, &game_type, players.clone())
+            .spawn(room_id, &game_type, &entry.binary, init_config, players.clone())
             .await
             .map_err(|e| {
-                tracing::error!(error=%e, "spawn failed");
+                tracing::error!(error = %e, "spawn failed");
+                // Rollback room status on failure (spec §1.1).
+                let db = state.db.clone();
+                tokio::spawn(async move {
+                    let _ = sqlx::query("UPDATE rooms SET status='Waiting' WHERE room_id = ?")
+                        .bind(room_id)
+                        .execute(&db)
+                        .await;
+                });
                 ApiError::InstanceStartFailed
             })?;
 
-        let ws_url = format!("ws://{}:8192/ws/{}", state.public_host, instance_id);
+        let ws_url = format!("ws://{}:{}/ws/{}", state.public_host, state.public_port, instance_id);
 
         tracing::info!(instance_id, ws_url = %ws_url, "game started");
         Ok(Json(StartResp { instance_id, ws_url }))
@@ -309,15 +406,15 @@ pub async fn list(
     State(state): State<SharedState>,
     _user: CurrentUser,
 ) -> Result<Json<ListResp>, ApiError> {
-    let rows: Vec<(i64, String, i64, String)> = sqlx::query_as(
-        "SELECT room_id, game_type, host_uid, status FROM rooms WHERE status IN ('Waiting', 'Running') ORDER BY room_id DESC LIMIT 50",
+    let rows: Vec<(i64, String, i64, String, Option<String>)> = sqlx::query_as(
+        "SELECT room_id, game_type, host_uid, status, variant FROM rooms WHERE status IN ('Waiting', 'Running') ORDER BY room_id DESC LIMIT 50",
     )
     .fetch_all(&state.db)
     .await
     .map_err(|e| ApiError::Internal(e.into()))?;
 
     let mut rooms = Vec::with_capacity(rows.len());
-    for (room_id, game_type, host_uid, status) in rows {
+    for (room_id, game_type, host_uid, status, variant) in rows {
         let players: Vec<(i64, String, i32)> = sqlx::query_as(
             "SELECT u.id, u.nickname, rp.seat FROM room_players rp JOIN users u ON u.id = rp.uid WHERE rp.room_id = ? ORDER BY rp.seat",
         )
@@ -325,14 +422,32 @@ pub async fn list(
         .fetch_all(&state.db)
         .await
         .map_err(|e| ApiError::Internal(e.into()))?;
+        let entry = state.games.get(&game_type);
+        let (min_players, max_players) = entry
+            .map(|e| (Some(e.min_players), Some(e.max_players)))
+            .unwrap_or((None, None));
         rooms.push(RoomInfo {
             room_id,
             game_type,
             host_uid,
             status,
+            variant,
             players: players.into_iter().map(|(uid, nickname, seat)| PlayerInfo { uid, nickname, seat }).collect(),
+            current_instance_id: None,
+            min_players,
+            max_players,
         });
     }
 
     Ok(Json(ListResp { rooms }))
+}
+
+#[derive(Debug, Serialize)]
+pub struct GamesResp {
+    pub games: Vec<serde_json::Value>,
+}
+
+pub async fn games(State(state): State<SharedState>) -> Json<GamesResp> {
+    let games = state.games.list_enabled().into_iter().map(public_view).collect();
+    Json(GamesResp { games })
 }

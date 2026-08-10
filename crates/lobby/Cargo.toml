@@ -41,6 +41,8 @@ rust-embed = "8"
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
 base64 = "0.22"
+toml = "0.8"
+governor = "0.6"
 
 [lints.rust]
 unsafe_code = "forbid"

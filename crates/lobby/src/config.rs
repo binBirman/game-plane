@@ -16,7 +16,12 @@ pub struct Config {
     pub log_keep_days: u64,
     pub pow_difficulty: u32,
     pub public_host: String,
+    pub public_port: u16,
     pub game_bin_path: std::path::PathBuf,
+    pub games_toml: Option<std::path::PathBuf>,
+    pub rate_limit_register_per_min: usize,
+    pub rate_limit_login_per_min: usize,
+    pub rate_limit_captcha_per_min: usize,
 }
 
 impl Config {
@@ -42,9 +47,34 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(crate::auth::pow::DEFAULT_DIFFICULTY);
         let public_host = env::var("LOBBY_PUBLIC_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+        let bind_port: u16 = bind_addr
+            .rsplit(':')
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8192);
+        let public_port = env::var("LOBBY_PUBLIC_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(bind_port);
         let game_bin_path = env::var("LOBBY_GAME_BIN")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| std::path::PathBuf::from("tictactoe"));
+        let games_toml = env::var("LOBBY_GAMES_TOML")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from);
+        let rate_limit_register_per_min = env::var("LOBBY_RL_REGISTER_PER_MIN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10);
+        let rate_limit_login_per_min = env::var("LOBBY_RL_LOGIN_PER_MIN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20);
+        let rate_limit_captcha_per_min = env::var("LOBBY_RL_CAPTCHA_PER_MIN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60);
         Self {
             bind_addr,
             database_url,
@@ -54,7 +84,12 @@ impl Config {
             log_keep_days,
             pow_difficulty,
             public_host,
+            public_port,
             game_bin_path,
+            games_toml,
+            rate_limit_register_per_min,
+            rate_limit_login_per_min,
+            rate_limit_captcha_per_min,
         }
     }
 }

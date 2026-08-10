@@ -42,6 +42,25 @@ else
     echo "==> /etc/lobby/lobby.env already exists, leaving untouched"
 fi
 
+# games.toml registry (only if missing)
+if [[ -f games.toml ]]; then
+    if [[ ! -f /etc/lobby/games.toml ]]; then
+        echo "==> installing /etc/lobby/games.toml"
+        install -m 644 -o root -g lobby games.toml /etc/lobby/games.toml
+    else
+        echo "==> /etc/lobby/games.toml already exists, leaving untouched"
+    fi
+fi
+
+# nginx reverse proxy example (optional, only if nginx is installed)
+if [[ -f nginx.conf.example ]] && command -v nginx >/dev/null 2>&1; then
+    if [[ ! -f /etc/nginx/sites-available/lobby.conf ]]; then
+        echo "==> installing /etc/nginx/sites-available/lobby.conf (review + enable manually)"
+        install -m 644 nginx.conf.example /etc/nginx/sites-available/lobby.conf
+        echo "    >>> edit server_name, then: sudo ln -s ../sites-available/lobby.conf /etc/nginx/sites-enabled/lobby && sudo systemctl reload nginx"
+    fi
+fi
+
 # systemd
 echo "==> installing systemd unit"
 install -m 644 lobby.service /etc/systemd/system/lobby.service

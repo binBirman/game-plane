@@ -8,7 +8,9 @@ use crate::http::error::ApiError;
 #[derive(Clone, Debug)]
 pub struct CurrentUser {
     pub uid: i64,
+    #[allow(dead_code)]
     pub username: String,
+    #[allow(dead_code)]
     pub nickname: String,
 }
 

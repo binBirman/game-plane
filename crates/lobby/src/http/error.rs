@@ -39,6 +39,8 @@ pub enum ApiError {
     InstanceNotReady,
     #[error("instance start failed")]
     InstanceStartFailed,
+    #[error("rate limited")]
+    RateLimited,
     #[error("internal error: {0}")]
     Internal(#[from] anyhow::Error),
 }
@@ -63,6 +65,7 @@ impl IntoResponse for ApiError {
             ApiError::InstanceNotFound => (StatusCode::NOT_FOUND, "INSTANCE_NOT_FOUND"),
             ApiError::InstanceNotReady => (StatusCode::CONFLICT, "INSTANCE_NOT_READY"),
             ApiError::InstanceStartFailed => (StatusCode::INTERNAL_SERVER_ERROR, "INSTANCE_START_FAILED"),
+            ApiError::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "RATE_LIMITED"),
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"),
         };
         let body = json!({

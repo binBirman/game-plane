@@ -36,6 +36,7 @@ async fn bridge(client_ws: WebSocket, instance_id: i64, game_port: u16) {
 
     let req = match axum::http::Request::builder()
         .method("GET")
+        .uri(format!("ws://127.0.0.1:{}/ws", game_port))
         .header("Host", format!("127.0.0.1:{}", game_port))
         .header("Upgrade", "websocket")
         .header("Connection", "Upgrade")

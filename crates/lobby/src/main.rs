@@ -1,19 +1,22 @@
 mod auth;
 mod config;
 mod db;
+mod games;
 mod http;
 mod instance;
 mod logging;
+mod ratelimit;
 mod state;
 mod ws_proxy;
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tower_http::trace::TraceLayer;
 
 use crate::config::Config;
+use crate::games::GameRegistry;
 use crate::http::router;
 use crate::instance::manager::InstanceManager;
 use crate::state::AppState;
@@ -27,7 +30,9 @@ async fn main() -> Result<()> {
         bind = %cfg.bind_addr,
         db = %cfg.database_url,
         public_host = %cfg.public_host,
+        public_port = cfg.public_port,
         game_bin = %cfg.game_bin_path.display(),
+        games_toml = %cfg.games_toml.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "<none>".into()),
         pid = std::process::id(),
         "lobby starting"
     );
@@ -35,23 +40,63 @@ async fn main() -> Result<()> {
     if let Some(path) = cfg.database_url.strip_prefix("sqlite://") {
         if let Some((dir, _)) = path.split_once('/') {
             if !dir.is_empty() && !std::path::Path::new(dir).exists() {
-                std::fs::create_dir_all(dir)?;
+                std::fs::create_dir_all(dir).with_context(|| format!("mkdir {dir}"))?;
             }
         }
     }
 
     let db = db::init_pool(&cfg.database_url).await?;
+
+    // Load games registry: prefer LOBBY_GAMES_TOML, otherwise fall back to a single
+    // auto-registered entry pointing at LOBBY_GAME_BIN (tictactoe default).
+    let games: Arc<GameRegistry> = if let Some(path) = &cfg.games_toml {
+        match GameRegistry::from_file(path, cfg.game_bin_path.clone()) {
+            Ok(reg) => Arc::new(reg),
+            Err(e) => {
+                tracing::error!(error = %e, "failed to load games.toml; falling back to default");
+                Arc::new(
+                    GameRegistry::new(cfg.game_bin_path.clone())
+                        .with_default("tictactoe", "井字棋"),
+                )
+            }
+        }
+    } else {
+        Arc::new(
+            GameRegistry::new(cfg.game_bin_path.clone())
+                .with_default("tictactoe", "井字棋"),
+        )
+    };
+    tracing::info!(
+        games = games.list_enabled().len(),
+        "game registry loaded"
+    );
+
     let instances = Arc::new(InstanceManager::new(db.clone(), cfg.game_bin_path.clone()));
 
     let state = Arc::new(AppState {
-        db,
+        db: db.clone(),
         session_ttl_days: cfg.session_ttl_days,
         pow_difficulty: cfg.pow_difficulty,
         public_host: cfg.public_host.clone(),
+        public_port: cfg.public_port,
+        game_bin_path: cfg.game_bin_path.clone(),
+        games: games.clone(),
         instances: instances.clone(),
+        rl_register: crate::ratelimit::RateLimiter::new(
+            std::time::Duration::from_secs(60),
+            cfg.rate_limit_register_per_min,
+        ),
+        rl_login: crate::ratelimit::RateLimiter::new(
+            std::time::Duration::from_secs(60),
+            cfg.rate_limit_login_per_min,
+        ),
+        rl_captcha: crate::ratelimit::RateLimiter::new(
+            std::time::Duration::from_secs(60),
+            cfg.rate_limit_captcha_per_min,
+        ),
     });
 
-    // Watchdog: scan for heartbeats every 5s
+    // Watchdog: heartbeat timeouts every 5s
     {
         let instances = instances.clone();
         tokio::spawn(async move {
@@ -63,6 +108,24 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Session GC: purge expired tokens every hour.
+    {
+        let db = db.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(3600));
+            loop {
+                tick.tick().await;
+                let res = sqlx::query("DELETE FROM sessions WHERE expires_at < datetime('now')")
+                    .execute(&db)
+                    .await;
+                match res {
+                    Ok(r) => tracing::info!(deleted = r.rows_affected(), "session gc"),
+                    Err(e) => tracing::warn!(error = %e, "session gc failed"),
+                }
+            }
+        });
+    }
+
     let app = router::build(state)
         .layer(TraceLayer::new_for_http())
         .layer(axum::middleware::from_fn(http::request_id::middleware));
@@ -70,10 +133,15 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&cfg.bind_addr).await?;
     tracing::info!(addr = %cfg.bind_addr, "lobby listening");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
+    tracing::info!("lobby: stopping all game instances gracefully");
+    instances.shutdown_all().await;
     tracing::info!("lobby stopped cleanly");
     tokio::time::sleep(Duration::from_millis(100)).await;
     Ok(())

@@ -18,6 +18,8 @@ CREATE TABLE IF NOT EXISTS rooms (
     game_type  TEXT NOT NULL,
     host_uid   INTEGER NOT NULL REFERENCES users(id),
     status     TEXT NOT NULL DEFAULT 'Waiting',  -- Waiting/Starting/Running/Finished/Destroyed
+    variant    TEXT,
+    config     TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
