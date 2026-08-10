@@ -1,0 +1,15 @@
+# Lobby game registry. Each [[games]] entry exposes a game_type that
+# clients can pass to POST /api/rooms. Disabled entries are skipped.
+#
+# `binary` is the absolute path to the game server. Lobby spawns it with
+# `LobbyInit` on stdin; see docs/protocol_spec.md §2.2.1.
+
+[[games]]
+type = "tictactoe"
+name = "井字棋"
+description = "三连一线"
+binary = "/usr/local/bin/tictactoe"
+min_players = 2
+max_players = 2
+enabled = true
+variants = []

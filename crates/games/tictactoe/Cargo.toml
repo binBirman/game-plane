@@ -1,0 +1,27 @@
+[package]
+name = "tictactoe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tictactoe"
+path = "src/main.rs"
+
+[dependencies]
+game-sdk = { path = "../../game-sdk" }
+protocol = { path = "../../protocol" }
+
+tokio = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+async-trait = "0.1"
+
+tracing = { workspace = true }
+
+anyhow = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"
