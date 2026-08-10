@@ -64,11 +64,11 @@ game-plane/
 ├── crates/
 │   ├── protocol/
 │   ├── lobby/
-│   ├── game-sdk/         # NEW：通信骨架 + GameLogic trait
+│   ├── game-sdk/         # ✓ 已完成：通信骨架 + GameLogic trait
 │   └── games/
-│       ├── tictactoe/    # 迁移自 crates/game/
-│       ├── <game-A>/     # NEW：等用户给规则后实现
-│       └── <game-B>/     # NEW：等用户给规则后实现
+│       ├── tictactoe/    # ✓ 已完成：迁移自 crates/game/，binary 名 `tictactoe`
+│       ├── <game-A>/     # 待用户给规则
+│       └── <game-B>/     # 待用户给规则
 └── docs/
 ```
 
@@ -201,11 +201,12 @@ crates/game/src/main.rs
 └── 井字棋规则（GameState、move、win 检测）
 ```
 
-**V1.1（计划，详见 `docs/games_architecture.md`）**：
+**V1.1（进行中，详见 `docs/games_architecture.md`）**：
 
-- `crates/game-sdk/` 抽出所有通信骨架，提供 `GameLogic` trait 与 `run()` 入口。
-- `crates/games/tictactoe`（已存在）以及待实现的 `<game-A>`、`<game-B>` 各自只实现 `GameLogic`。
-- 新游戏 = 新 crate + 在 `games.toml` 注册，Lobby / SDK 不动。
+- ✓ `crates/game-sdk/` 已抽出通信骨架，提供 `GameLogic` trait 与 `run()` 入口。
+- ✓ `crates/games/tictactoe`（已迁移）以及待实现的 `<game-A>`、`<game-B>` 各自只实现 `GameLogic`。
+- ✗ 新游戏的 `games.toml` 注册表、`GET /api/games`、前端多游戏卡片尚未做。
+- 新游戏接入路径明确：新建 `crates/games/<name>` + 在 `games.toml` 注册，Lobby / SDK 不动。
 
 ## 4. 接口协议
 

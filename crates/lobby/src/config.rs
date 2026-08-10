@@ -44,7 +44,7 @@ impl Config {
         let public_host = env::var("LOBBY_PUBLIC_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
         let game_bin_path = env::var("LOBBY_GAME_BIN")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::path::PathBuf::from("game"));
+            .unwrap_or_else(|_| std::path::PathBuf::from("tictactoe"));
         Self {
             bind_addr,
             database_url,

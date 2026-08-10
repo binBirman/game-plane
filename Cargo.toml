@@ -3,7 +3,8 @@ resolver = "2"
 members = [
     "crates/protocol",
     "crates/lobby",
-    "crates/game",
+    "crates/game-sdk",
+    "crates/games/tictactoe",
 ]
 
 [workspace.package]

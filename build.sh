@@ -34,7 +34,7 @@ echo "==> cargo build --$PROFILE --target $TARGET"
 cargo build --"$PROFILE" --target "$TARGET"
 
 LOBBY_BIN="target/$TARGET/$PROFILE/lobby"
-GAME_BIN="target/$TARGET/$PROFILE/game"
+GAME_BIN="target/$TARGET/$PROFILE/tictactoe"
 [[ -f "$LOBBY_BIN" ]] || { echo "Build failed: $LOBBY_BIN not found" >&2; exit 1; }
 [[ -f "$GAME_BIN" ]] || { echo "Build failed: $GAME_BIN not found" >&2; exit 1; }
 
@@ -43,14 +43,14 @@ DIST="dist/lobby-$VERSION"
 rm -rf "$DIST" "dist/lobby-$VERSION.tar.gz"
 mkdir -p "$DIST"
 cp "$LOBBY_BIN" "$DIST/lobby"
-cp "$GAME_BIN" "$DIST/game"
+cp "$GAME_BIN" "$DIST/tictactoe"
 cp packaging/lobby.service       "$DIST/"
 cp packaging/lobby.env.example  "$DIST/lobby.env.example"
 cp packaging/install.sh          "$DIST/install.sh"
 cp packaging/uninstall.sh        "$DIST/uninstall.sh"
 cp packaging/README.md           "$DIST/README.md"
 cp -r crates/lobby/static        "$DIST/static"
-chmod +x "$DIST/install.sh" "$DIST/uninstall.sh" "$DIST/lobby" "$DIST/game"
+chmod +x "$DIST/install.sh" "$DIST/uninstall.sh" "$DIST/lobby" "$DIST/tictactoe"
 
 # 6. tarball
 tar czf "dist/lobby-$VERSION.tar.gz" -C dist "lobby-$VERSION"

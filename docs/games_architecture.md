@@ -260,14 +260,27 @@ SDK / Lobby **不变**。游戏之间不互相影响。
 
 | # | 内容 | 状态 |
 |---|---|---|
-| 1 | `game-sdk` 骨架 + `run()` + `GameLogic` trait | 计划 |
-| 2 | tictactoe 迁移到 SDK（行为不变） | 计划 |
+| 1 | `game-sdk` 骨架 + `run()` + `GameLogic` trait | ✓ 已完成 |
+| 2 | tictactoe 迁移到 SDK（行为不变） | ✓ 已完成 |
 | 3 | `games/<game-A>` 用户给规则后实现 | 等规则 |
 | 4 | `games/<game-B>` 用户给规则后实现 | 等规则 |
-| 5 | Lobby `games.toml` 注册表 + `GET /api/games` + 前端多游戏卡片 | 计划 |
-| 6 | 单元测试 + protocol_spec 增订 + test.sh 加新游戏烟测 | 等游戏实现后 |
+| 5 | Lobby `games.toml` 注册表 + `GET /api/games` + 前端多游戏卡片 | 待做 |
+| 6 | 单元测试 + protocol_spec 增订 + test.sh 加新游戏烟测 | 部分（room+WS 烟测已加在 test.sh） |
 
-**最小可用闭环** = 阶段 1+2+5（SDK + tictactoe 验证 + 注册表/UI，新游戏在注册表里 disabled）。验证扩展点工作后，等用户给规则再做 3 和 4。
+**已完成**：
+- `crates/game-sdk/` 库：`GameLogic` trait + `run()` + WS/session/heartbeat 全套通信骨架
+- `crates/games/tictactoe/`：仅含游戏规则 + `GameLogic` 实现，binary 名 `tictactoe`
+- `protocol::LobbyInit` 加 `config: Option<Value>` 字段
+- `tools/ws_client.py`：Python 实现的 RFC 6455 WS 客户端（无外部依赖）
+- `tools/test.sh` 加 8 个新用例：注册 B、login B、create room、join、start、WS roundtrip、leave x2
+
+**未实现**：
+- games.toml 注册表（lobby 仍用单一 `LOBBY_GAME_BIN` 环境变量，默认指向 `tictactoe`）
+- `GET /api/games` 端点
+- `POST /api/rooms` 接受 `variant` / `config` 字段
+- 前端多游戏卡片
+
+**最小可用闭环** = 阶段 1+2+5（SDK + tictactoe 验证 + 注册表/UI）。扩展点已就绪：新增游戏只需 `crates/games/<name>` + 在 `games.toml` 注册。
 
 ## 10. 下次实现清单
 

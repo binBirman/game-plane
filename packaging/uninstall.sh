@@ -13,7 +13,7 @@ systemctl disable lobby.service 2>/dev/null || true
 echo "==> removing files"
 rm -f /etc/systemd/system/lobby.service
 rm -f /usr/local/bin/lobby
-rm -f /usr/local/bin/game
+rm -f /usr/local/bin/tictactoe
 rm -rf /etc/lobby
 
 systemctl daemon-reload

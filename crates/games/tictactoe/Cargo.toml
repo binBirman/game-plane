@@ -1,24 +1,23 @@
 [package]
-name = "game"
+name = "tictactoe"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "game"
+name = "tictactoe"
 path = "src/main.rs"
 
 [dependencies]
-protocol = { path = "../protocol" }
+game-sdk = { path = "../../game-sdk" }
+protocol = { path = "../../protocol" }
 
 tokio = { workspace = true }
 
-axum = { version = "0.7", features = ["macros", "ws"] }
-tokio-tungstenite = "0.24"
-futures-util = "0.3"
-
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+async-trait = "0.1"
 
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

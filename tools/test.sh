@@ -14,6 +14,7 @@ HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8192}"
 BASE="${BASE_URL:-http://${HOST}:${PORT}}"
 TEST_USER="${TEST_USER:-lobbytest_$(date +%s%N)}"
+TEST_USER_B="${TEST_USER_B:-${TEST_USER}_b}"
 STRONG_PASS="Test_123!"
 
 # auto-bypass system proxy
@@ -213,6 +214,156 @@ run_test "POST /api/login (no such user)" 401 \
     -X POST "$BASE/api/login" \
     -H 'Content-Type: application/json' \
     -d "{\"username\":\"nonexistent_$$_$(date +%s)\",\"password\":\"x\",\"captcha\":$CAP}"
+
+# ─── 15-22. room + game spawn + WS roundtrip ───────────────────────────
+TOKEN_A=""
+UID_A=""
+TOKEN_B=""
+UID_B=""
+ROOM_ID=""
+INSTANCE_ID=""
+WS_URL=""
+
+ensure_captcha
+run_test "POST /api/register (user B)" 200 \
+    -X POST "$BASE/api/register" \
+    -H 'Content-Type: application/json' \
+    -d "{\"username\":\"$TEST_USER_B\",\"password\":\"$STRONG_PASS\",\"nickname\":\"User B\",\"captcha\":$CAP}"
+
+ensure_captcha
+login_b_body=$(curl -sS "${CURL_OPTS[@]}" -X POST "$BASE/api/login" \
+    -H 'Content-Type: application/json' \
+    -d "{\"username\":\"$TEST_USER_B\",\"password\":\"$STRONG_PASS\",\"captcha\":$CAP}")
+TOKEN_B=$(echo "$login_b_body" | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))" 2>/dev/null || echo "")
+UID_B=$(echo "$login_b_body" | python3 -c "import sys,json; print(json.load(sys.stdin).get('uid',''))" 2>/dev/null || echo "")
+
+total=$((total+1))
+echo
+echo "${B}─── Test $total: login user B (correct creds) ───${N}"
+echo "  ${D}body:${N} $login_b_body"
+if [[ -n "$TOKEN_B" && ${#TOKEN_B} -eq 64 ]]; then
+    echo "  ${G}PASS${N} (64-hex token)"; pass=$((pass+1))
+else
+    echo "  ${R}FAIL${N}"; fail=$((fail+1))
+fi
+
+run_test "POST /api/rooms (create as A)" 201 \
+    -X POST "$BASE/api/rooms" \
+    -H "Authorization: Bearer $token" \
+    -H 'Content-Type: application/json' \
+    -d '{"game_type":"tictactoe"}'
+
+room_create_body=$(curl -sS "${CURL_OPTS[@]}" -X POST "$BASE/api/rooms" \
+    -H "Authorization: Bearer $token" \
+    -H 'Content-Type: application/json' \
+    -d '{"game_type":"tictactoe"}')
+ROOM_ID=$(echo "$room_create_body" | python3 -c "import sys,json; print(json.load(sys.stdin).get('room_id',''))" 2>/dev/null || echo "")
+
+total=$((total+1))
+echo
+echo "${B}─── Test $total: capture room_id ───${N}"
+echo "  ${D}room_id:${N} ${ROOM_ID:-<none>}"
+if [[ -n "$ROOM_ID" && "$ROOM_ID" =~ ^[0-9]+$ ]]; then
+    echo "  ${G}PASS${N}"; pass=$((pass+1))
+else
+    echo "  ${R}FAIL${N}"; fail=$((fail+1))
+fi
+
+run_test "POST /api/rooms/$ROOM_ID/join (as B)" 200 \
+    -X POST "$BASE/api/rooms/$ROOM_ID/join" \
+    -H "Authorization: Bearer $TOKEN_B" \
+    -H 'Content-Type: application/json' \
+    -d '{}'
+
+run_test "POST /api/rooms/$ROOM_ID/start (as A)" 200 \
+    -X POST "$BASE/api/rooms/$ROOM_ID/start" \
+    -H "Authorization: Bearer $token" \
+    -H 'Content-Type: application/json' \
+    -d '{}'
+
+start_body=$(curl -sS "${CURL_OPTS[@]}" -X POST "$BASE/api/rooms/$ROOM_ID/start" \
+    -H "Authorization: Bearer $token" \
+    -H 'Content-Type: application/json' \
+    -d '{}')
+INSTANCE_ID=$(echo "$start_body" | python3 -c "import sys,json; print(json.load(sys.stdin).get('instance_id',''))" 2>/dev/null || echo "")
+WS_URL=$(echo "$start_body" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ws_url',''))" 2>/dev/null || echo "")
+
+total=$((total+1))
+echo
+echo "${B}─── Test $total: start returns ws_url with instance_id ───${N}"
+echo "  ${D}instance_id:${N} ${INSTANCE_ID:-<none>}"
+echo "  ${D}ws_url     :${N} ${WS_URL:-<none>}"
+if [[ -n "$INSTANCE_ID" && "$WS_URL" == *"/ws/$INSTANCE_ID"* ]]; then
+    echo "  ${G}PASS${N}"; pass=$((pass+1))
+else
+    echo "  ${R}FAIL${N}"; fail=$((fail+1))
+fi
+
+# WS roundtrip via tools/ws_client.py
+if [[ -n "$INSTANCE_ID" && -n "$token" ]]; then
+    total=$((total+1))
+    echo
+    echo "${B}─── Test $total: WS roundtrip (login + snapshot + move) ───${N}"
+    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+    ws_out=$(python3 - "$HOST" "$PORT" "$INSTANCE_ID" "$token" "$UID_A" <<'PYEOF'
+import sys
+sys.path.insert(0, sys.argv[0] and "" or ".")
+sys.path.insert(0, "$SCRIPT_DIR")
+from ws_client import handshake, send_text, recv_text
+
+host, port, instance_id, token, uid_a = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5]
+
+try:
+    sock = handshake(host, port, "/ws/" + instance_id)
+except Exception as e:
+    print("HANDSHAKE_FAIL:" + str(e))
+    sys.exit(1)
+
+try:
+    send_text(sock, '{"type":"login","uid":' + str(uid_a) + ',"session":"' + token + '"}')
+    f1 = recv_text(sock)
+    f2 = recv_text(sock)
+    if not f1 or 'login_ok' not in f1:
+        print("LOGIN_FAIL:" + (f1 or "<none>"))
+        sys.exit(2)
+    if not f2 or 'snapshot' not in f2:
+        print("SNAPSHOT_FAIL:" + (f2 or "<none>"))
+        sys.exit(3)
+    send_text(sock, '{"type":"game","data":{"action":"move","cell":0}}')
+    f3 = recv_text(sock)
+    if not f3 or 'game' not in f3:
+        print("MOVE_FAIL:" + (f3 or "<none>"))
+        sys.exit(4)
+    print("OK")
+except Exception as e:
+    print("ERR:" + str(e))
+    sys.exit(5)
+finally:
+    try: sock.close()
+    except: pass
+PYEOF
+    )
+    if [[ "$ws_out" == "OK" ]]; then
+        echo "  ${D}handshake+login+snapshot+move all OK${N}"
+        echo "  ${G}PASS${N}"; pass=$((pass+1))
+    else
+        echo "  ${D}output:${N} $ws_out"
+        echo "  ${R}FAIL${N}"; fail=$((fail+1))
+    fi
+fi
+
+# Cleanup: A leaves, then B leaves
+run_test "POST /api/rooms/$ROOM_ID/leave (A)" 200 \
+    -X POST "$BASE/api/rooms/$ROOM_ID/leave" \
+    -H "Authorization: Bearer $token" \
+    -H 'Content-Type: application/json' \
+    -d '{}'
+
+run_test "POST /api/rooms/$ROOM_ID/leave (B)" 200 \
+    -X POST "$BASE/api/rooms/$ROOM_ID/leave" \
+    -H "Authorization: Bearer $TOKEN_B" \
+    -H 'Content-Type: application/json' \
+    -d '{}'
 
 # ─── summary ──────────────────────────────────────────────────────────
 echo

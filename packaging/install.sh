@@ -25,12 +25,12 @@ install -d -m 755 /etc/lobby
 echo "==> installing binaries to /usr/local/bin/"
 install -m 755 "$BIN_SRC" /usr/local/bin/lobby
 
-GAME_SRC="$(cd "$(dirname "$BIN_SRC")" && pwd)/game"
+GAME_SRC="$(cd "$(dirname "$BIN_SRC")" && pwd)/tictactoe"
 if [[ -x "$GAME_SRC" ]]; then
-    install -m 755 "$GAME_SRC" /usr/local/bin/game
-    echo "==> installed /usr/local/bin/game"
+    install -m 755 "$GAME_SRC" /usr/local/bin/tictactoe
+    echo "==> installed /usr/local/bin/tictactoe"
 else
-    echo "WARN: game binary not found alongside lobby; install.sh will skip it"
+    echo "WARN: tictactoe binary not found alongside lobby; install.sh will skip it"
 fi
 
 # env file (only if missing)
