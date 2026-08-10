@@ -4,3 +4,5 @@
 /dist
 /logs
 *.log
+# Python bytecode
+tools/__pycache__/
