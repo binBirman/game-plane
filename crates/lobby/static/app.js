@@ -71,12 +71,19 @@
         setTimeout(() => { t.className = "toast " + kind; }, 2500);
     }
 
-    function logout() {
+    async function logout() {
+        // Best-effort server-side session revoke. Failures (offline, 401,
+        // already-revoked) are silently swallowed — the local clear below
+        // is what actually un-authenticates the UI.
+        try {
+            await fetch("/api/logout", { method: "POST", headers: { "Authorization": "Bearer " + state.token } });
+        } catch (_) { /* network error etc. — keep going */ }
         localStorage.removeItem("lobby_token");
         localStorage.removeItem("lobby_uid");
         localStorage.removeItem("lobby_nick");
         state.token = state.uid = 0; state.nickname = "";
         stopRoomPolling();
+        if (gameOverNavTimer) { clearTimeout(gameOverNavTimer); gameOverNavTimer = null; }
         location.hash = "#login";
         render();
     }
@@ -921,6 +928,7 @@
     let boardState = null;
     let myUid = state.uid;
     let gameWs = null;
+    let gameOverNavTimer = null;  // set when modal shows, cleared on hide/click
 
     function renderGame(instanceId) {
         // Keep currentRoomId so the game-over modal can route back to #room/<id>.
@@ -1086,11 +1094,24 @@
         modal.classList.remove("hidden");
         // Stop accepting further moves on the underlying board.
         try { gameWs && gameWs.close(); } catch {}
+
+        // Auto-navigate to #room/<id> after a few seconds if the user does
+        // not interact. The room stays alive (multi-game design) so the user
+        // lands on the room page, ready for the next round.
+        if (roomId && !gameOverNavTimer) {
+            gameOverNavTimer = setTimeout(() => {
+                if (location.hash.startsWith("#game/")) {
+                    location.hash = `#room/${roomId}`;
+                }
+                gameOverNavTimer = null;
+            }, 5000);
+        }
     }
 
     function hideGameOver() {
         const modal = $("#game-over-modal");
         if (modal) modal.classList.add("hidden");
+        if (gameOverNavTimer) { clearTimeout(gameOverNavTimer); gameOverNavTimer = null; }
     }
 
     function seatMark(uid) {
