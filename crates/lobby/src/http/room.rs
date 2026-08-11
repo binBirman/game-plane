@@ -267,6 +267,13 @@ pub async fn leave(
     let span = tracing::info_span!("room.leave", room_id, uid = user.uid);
 
     async move {
+        // Pull host_uid up front — we need it to decide whether to promote.
+        let host_uid: i64 = sqlx::query_scalar("SELECT host_uid FROM rooms WHERE room_id = ?")
+            .bind(room_id)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|e| ApiError::Internal(e.into()))?;
+
         let affected = sqlx::query("DELETE FROM room_players WHERE room_id = ? AND uid = ?")
             .bind(room_id)
             .bind(user.uid)
@@ -278,17 +285,32 @@ pub async fn leave(
             return Err(ApiError::NotInRoom);
         }
 
-        // If empty, mark destroyed.
-        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM room_players WHERE room_id = ?")
-            .bind(room_id)
-            .fetch_one(&state.db)
-            .await
-            .map_err(|e| ApiError::Internal(e.into()))?;
-        if count.0 == 0 {
-            let _ = sqlx::query("UPDATE rooms SET status='Destroyed' WHERE room_id = ?")
+        // Auto-close when empty; otherwise, if the host left, promote the
+        // earliest-joined remaining player so every room always has a host.
+        let remaining: Vec<(i64,)> = sqlx::query_as(
+            "SELECT uid FROM room_players WHERE room_id = ? \
+             ORDER BY joined_at ASC, seat ASC LIMIT 1",
+        )
+        .bind(room_id)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+
+        if remaining.is_empty() {
+            sqlx::query("UPDATE rooms SET status='Destroyed' WHERE room_id = ?")
                 .bind(room_id)
                 .execute(&state.db)
-                .await;
+                .await
+                .map_err(|e| ApiError::Internal(e.into()))?;
+        } else if host_uid == user.uid {
+            let new_host = remaining[0].0;
+            sqlx::query("UPDATE rooms SET host_uid = ? WHERE room_id = ?")
+                .bind(new_host)
+                .bind(room_id)
+                .execute(&state.db)
+                .await
+                .map_err(|e| ApiError::Internal(e.into()))?;
+            tracing::info!(room_id, old_host = user.uid, new_host, "host promoted");
         }
 
         Ok(Json(serde_json::json!({"ok": true})))
@@ -345,18 +367,67 @@ pub async fn start(
             .get(&game_type)
             .ok_or_else(|| ApiError::GameTypeUnsupported(game_type.clone()))?;
 
-        let players: Vec<(i64, String)> = sqlx::query_as(
-            "SELECT rp.uid, s.token FROM room_players rp JOIN sessions s ON s.user_id = rp.uid WHERE rp.room_id = ?",
+        // Fail fast with a clear 503 instead of letting `Command::spawn` blow
+        // up later — most "500" reports trace back to PATH/lobby.env mistakes.
+        match entry.resolve_binary() {
+            crate::games::registry::BinResolve::Ok => {}
+            crate::games::registry::BinResolve::NotFound(why) => {
+                tracing::error!(
+                    game_type = %game_type,
+                    bin = %entry.binary.display(),
+                    why = %why,
+                    "game binary missing"
+                );
+                return Err(ApiError::GameBinaryNotFound(format!(
+                    "{} ({})",
+                    entry.binary.display(),
+                    why
+                )));
+            }
+            crate::games::registry::BinResolve::NotExecutable => {
+                tracing::error!(
+                    game_type = %game_type,
+                    bin = %entry.binary.display(),
+                    "game binary not executable"
+                );
+                return Err(ApiError::GameBinaryNotFound(format!(
+                    "{} (not executable — chmod +x)",
+                    entry.binary.display()
+                )));
+            }
+        }
+
+        // Every non-expired session per player. A user can hold several active
+        // sessions (re-logins in another tab leave old rows until GC); we pass
+        // them all so the game accepts any of them on login/reconnect, not just
+        // the "latest".
+        let token_rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT rp.uid, s.token
+             FROM room_players rp
+             JOIN sessions s ON s.user_id = rp.uid
+             WHERE rp.room_id = ?
+               AND s.expires_at >= datetime('now')
+             ORDER BY rp.uid, s.created_at",
         )
         .bind(room_id)
         .fetch_all(&state.db)
         .await
         .map_err(|e| ApiError::Internal(e.into()))?;
 
-        if players.len() < entry.min_players {
+        let mut by_uid: std::collections::BTreeMap<i64, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for (uid, tok) in token_rows {
+            by_uid.entry(uid).or_default().push(tok);
+        }
+        let rows: Vec<protocol::PlayerInit> = by_uid
+            .into_iter()
+            .map(|(uid, sessions)| protocol::PlayerInit { uid, sessions })
+            .collect();
+
+        if rows.len() < entry.min_players {
             return Err(ApiError::NotEnoughPlayers);
         }
-        if players.len() > entry.max_players {
+        if rows.len() > entry.max_players {
             return Err(ApiError::RoomFull);
         }
 
@@ -373,19 +444,20 @@ pub async fn start(
 
         let instance_id = state
             .instances
-            .spawn(room_id, &game_type, &entry.binary, init_config, players.clone())
+            .spawn(room_id, &game_type, &entry.binary, init_config, rows.clone())
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "spawn failed");
                 // Rollback room status on failure (spec §1.1).
                 let db = state.db.clone();
+                let rid = room_id;
                 tokio::spawn(async move {
                     let _ = sqlx::query("UPDATE rooms SET status='Waiting' WHERE room_id = ?")
-                        .bind(room_id)
+                        .bind(rid)
                         .execute(&db)
                         .await;
                 });
-                ApiError::InstanceStartFailed
+                ApiError::InstanceStartFailed(format!("{e:#}"))
             })?;
 
         let ws_url = format!("ws://{}:{}/ws/{}", state.public_host, state.public_port, instance_id);

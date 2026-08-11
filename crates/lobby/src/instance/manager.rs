@@ -94,7 +94,7 @@ impl InstanceManager {
         game_type: &str,
         bin: &std::path::Path,
         init_config: Option<serde_json::Value>,
-        players: Vec<(i64, String)>,
+        players: Vec<protocol::PlayerInit>,
     ) -> Result<i64> {
         let port = allocate_port().await?;
 
@@ -102,9 +102,7 @@ impl InstanceManager {
             "room_id": room_id,
             "game_type": game_type,
             "listen": format!("127.0.0.1:{}", port),
-            "players": players.iter().map(|(uid, session)| {
-                serde_json::json!({"uid": uid, "session": session})
-            }).collect::<Vec<_>>(),
+            "players": players,
             "config": init_config,
         });
         let init_line = format!("{}\n", init_payload);

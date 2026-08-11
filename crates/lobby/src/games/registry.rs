@@ -22,6 +22,22 @@ pub struct GameEntry {
     pub variants: Vec<String>,
 }
 
+impl GameEntry {
+    /// Resolve `binary` to a runnable file. Absolute / relative-with-dir
+    /// paths are checked literally; bare names walk `PATH`.
+    pub fn resolve_binary(&self) -> BinResolve {
+        resolve_binary(&self.binary)
+    }
+}
+
+/// Result of resolving a configured game binary.
+#[derive(Debug)]
+pub enum BinResolve {
+    Ok,
+    NotFound(String),
+    NotExecutable,
+}
+
 fn default_min() -> usize {
     2
 }
@@ -106,4 +122,46 @@ pub fn public_view(g: &GameEntry) -> serde_json::Value {
         "max_players": g.max_players,
         "variants": g.variants,
     })
+}
+
+/// Resolve a configured game binary path. Distinguishes "missing" from
+/// "exists but not executable" so the start handler can return a useful
+/// `GAME_BINARY_NOT_FOUND` instead of an opaque 500.
+pub fn resolve_binary(bin: &Path) -> BinResolve {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Absolute or relative-with-dir → check the literal path.
+    if bin.is_absolute() || bin.components().count() > 1 {
+        return match std::fs::metadata(bin) {
+            Err(e) => BinResolve::NotFound(e.to_string()),
+            Ok(md) if !md.is_file() => BinResolve::NotFound("not a regular file".into()),
+            Ok(md) => {
+                if md.permissions().mode() & 0o111 == 0 {
+                    BinResolve::NotExecutable
+                } else {
+                    BinResolve::Ok
+                }
+            }
+        };
+    }
+
+    // Bare name → walk PATH.
+    let Some(paths) = std::env::var_os("PATH") else {
+        return BinResolve::NotFound("PATH env var not set".into());
+    };
+    let mut tried = Vec::new();
+    for p in std::env::split_paths(&paths) {
+        let candidate = Path::new(&p).join(bin);
+        tried.push(candidate.display().to_string());
+        if let Ok(md) = std::fs::metadata(&candidate) {
+            if md.is_file() {
+                return if md.permissions().mode() & 0o111 != 0 {
+                    BinResolve::Ok
+                } else {
+                    BinResolve::NotExecutable
+                };
+            }
+        }
+    }
+    BinResolve::NotFound(format!("searched PATH: {}", tried.join(", ")))
 }

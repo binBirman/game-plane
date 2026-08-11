@@ -37,8 +37,10 @@ pub enum ApiError {
     InstanceNotFound,
     #[error("instance not ready")]
     InstanceNotReady,
-    #[error("instance start failed")]
-    InstanceStartFailed,
+    #[error("instance start failed: {0}")]
+    InstanceStartFailed(String),
+    #[error("game binary not found: {0}")]
+    GameBinaryNotFound(String),
     #[error("rate limited")]
     RateLimited,
     #[error("internal error: {0}")]
@@ -64,7 +66,8 @@ impl IntoResponse for ApiError {
             ApiError::GameTypeUnsupported(_) => (StatusCode::BAD_REQUEST, "GAME_TYPE_UNSUPPORTED"),
             ApiError::InstanceNotFound => (StatusCode::NOT_FOUND, "INSTANCE_NOT_FOUND"),
             ApiError::InstanceNotReady => (StatusCode::CONFLICT, "INSTANCE_NOT_READY"),
-            ApiError::InstanceStartFailed => (StatusCode::INTERNAL_SERVER_ERROR, "INSTANCE_START_FAILED"),
+            ApiError::InstanceStartFailed(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INSTANCE_START_FAILED"),
+            ApiError::GameBinaryNotFound(_) => (StatusCode::SERVICE_UNAVAILABLE, "GAME_BINARY_NOT_FOUND"),
             ApiError::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "RATE_LIMITED"),
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"),
         };

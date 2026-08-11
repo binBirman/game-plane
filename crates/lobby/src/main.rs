@@ -70,6 +70,28 @@ async fn main() -> Result<()> {
         games = games.list_enabled().len(),
         "game registry loaded"
     );
+    for g in games.list_enabled() {
+        match g.resolve_binary() {
+            crate::games::registry::BinResolve::Ok => {
+                tracing::info!(game_type = %g.r#type, bin = %g.binary.display(), "game binary ok");
+            }
+            crate::games::registry::BinResolve::NotFound(why) => {
+                tracing::error!(
+                    game_type = %g.r#type,
+                    bin = %g.binary.display(),
+                    why = %why,
+                    "game binary NOT FOUND at startup — POST /api/rooms/:id/start will return 503"
+                );
+            }
+            crate::games::registry::BinResolve::NotExecutable => {
+                tracing::error!(
+                    game_type = %g.r#type,
+                    bin = %g.binary.display(),
+                    "game binary NOT EXECUTABLE at startup — chmod +x the binary"
+                );
+            }
+        }
+    }
 
     let instances = Arc::new(InstanceManager::new(db.clone(), cfg.game_bin_path.clone()));
 

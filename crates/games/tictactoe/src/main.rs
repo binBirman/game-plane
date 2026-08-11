@@ -17,7 +17,7 @@ struct TicTacToe {
     board: [Option<i64>; 9],
     turn: i64,
     players: Vec<i64>,
-    player_sessions: Vec<(i64, String)>,
+    player_sessions: Vec<(i64, Vec<String>)>,
     phase: String, // "playing" | "finished"
     winner: Option<i64>,
 }
@@ -29,7 +29,7 @@ impl GameLogic for TicTacToe {
     fn new(players: &[PlayerInit], _config: &Self::Config) -> Self {
         let player_sessions = players
             .iter()
-            .map(|p| (p.uid, p.session.clone()))
+            .map(|p| (p.uid, p.sessions.clone()))
             .collect();
         let player_uids: Vec<i64> = players.iter().map(|p| p.uid).collect();
         let turn = player_uids.first().copied().unwrap_or(0);
@@ -108,7 +108,7 @@ impl GameLogic for TicTacToe {
     fn validate_session(&self, uid: i64, session: &str) -> bool {
         self.player_sessions
             .iter()
-            .any(|(u, s)| *u == uid && *s == session)
+            .any(|(u, ss)| *u == uid && ss.iter().any(|s| s == session))
     }
 
     fn result(&self) -> Value {
