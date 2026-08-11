@@ -20,24 +20,14 @@ pub fn verify_password(password: &str, hash: &str) -> Result<bool> {
         .is_ok())
 }
 
-/// Password policy:
-///   - length >= 9
-///   - at least one ASCII digit
-///   - at least one ASCII letter
-///   - at least one non-alphanumeric character (special)
+/// Password policy: length >= 8 (Unicode chars; bytes-only limit could be
+/// added if abuse appears in metrics). Complexity rules (digit/letter/special)
+/// intentionally dropped — users find them hostile and length is the
+/// dominant factor against brute force once we hash with argon2.
 pub fn validate_strength(password: &str) -> Result<(), &'static str> {
     let len = password.chars().count();
-    if len < 9 {
-        return Err("password must be at least 9 characters");
-    }
-    if !password.chars().any(|c| c.is_ascii_digit()) {
-        return Err("password must contain a digit");
-    }
-    if !password.chars().any(|c| c.is_ascii_alphabetic()) {
-        return Err("password must contain a letter");
-    }
-    if !password.chars().any(|c| !c.is_alphanumeric()) {
-        return Err("password must contain a special character");
+    if len < 8 {
+        return Err("password must be at least 8 characters");
     }
     Ok(())
 }
@@ -47,23 +37,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn accepts_strong_password() {
-        assert!(validate_strength("Secret_123").is_ok());
-        assert!(validate_strength("abc123XYZ!").is_ok());
-        assert!(validate_strength("passw0rd!").is_ok());
+    fn accepts_eight_or_more() {
+        assert!(validate_strength("abcdefgh").is_ok());         // 8 lowercase
+        assert!(validate_strength("12345678").is_ok());         // 8 digits
+        assert!(validate_strength("Test1234").is_ok());         // 8 mixed
+        assert!(validate_strength("Secret_123_long_password").is_ok()); // long
     }
 
     #[test]
-    fn rejects_short() {
-        assert!(validate_strength("Ab1!").is_err());
-        assert!(validate_strength("Aa1!2345").is_err()); // 8 chars
-    }
-
-    #[test]
-    fn rejects_missing_classes() {
-        assert!(validate_strength("nodigits!!").is_err());
-        assert!(validate_strength("NOLOWER123!").is_ok()); // upper is still letter
-        assert!(validate_strength("ONLYLetters!").is_err()); // no digit
-        assert!(validate_strength("NoSpecial123").is_err());
+    fn rejects_below_eight() {
+        assert!(validate_strength("").is_err());
+        assert!(validate_strength("a").is_err());
+        assert!(validate_strength("1234567").is_err());         // 7 chars
     }
 }
