@@ -399,6 +399,8 @@ impl GameLogic for MyGame {
     fn is_over(&self) -> bool { false }
     fn phase(&self) -> PhaseInfo { PhaseInfo { name: "playing".into(), active_player: None, awaiting: vec![], time_limit_ms: None } }
     fn validate_session(&self, _uid: i64, _session: &str) -> bool { true }
+    // Hint: each PlayerInit carries `sessions: Vec<String>` — all non-expired
+    // tokens Lobby has for that uid. Accept any of them on login/reconnect.
     fn min_players(&self) -> usize { 2 }
     fn max_players(&self) -> usize { 4 }
     fn game_name(&self) -> &'static str { "My Game" }

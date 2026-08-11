@@ -34,27 +34,33 @@ V1 范围：注册、登录/会话鉴权、房间管理、游戏启动、动态�
 
 补充说明：
 
-- `Finished → Starting` 的 restart 由房主 POST start 触发。
-- 任何非 `Destroyed` 状态在以下情况进入 `Destroyed`：实例异常（心跳超 15s / 进程崩溃）、空房、超时、Lobby 回收。
-- `Starting` 启动失败（spawn 失败 / 进程立即退出）回滚到 `Waiting`，可重试。
+- `Finished → Starting` 的 restart 由房主 POST start 触发（**同一房间多局游戏**：一局结束后房间仍在，可继续 start）。
+- 进入 `Destroyed` 的唯一条件：**全员离开**。不另设"空房超时"。实例异常 / 心跳超 15s / 进程崩溃 → `Waiting`（可重新开局），不是 `Destroyed`。
+- `Starting` 启动失败（spawn 失败 / 进程立即退出 / ready 超时 10s）回滚到 `Waiting`，可重试。
 
 | 当前 | 触发 | 条件/事件 | 目标 |
 | --- | --- | --- | --- |
 | - | 创建房间 | POST /api/rooms | Waiting |
 | Waiting | 房主 start | POST start，人数满足（≥ 2） | Starting |
 | Starting | Game ready | 收到 `{"event":"ready"}` | Running |
-| Starting | 启动失败 | spawn 失败 / 进程立即退出 | Waiting（回滚，可重试） |
+| Starting | 启动失败 | spawn 失败 / 进程立即退出 / ready 超 10s | Waiting（回滚，可重试） |
 | Running | Game 结束 | 收到 `{"event":"finished"}` | Finished |
-| Finished | 重新开局 | 房主 POST start（新 GameInstance） | Starting |
-| Finished | 玩家离开后空房 | 全员离开 / 超时 | Destroyed |
-| 任意非 Destroyed | 实例异常 | watchdog 判定（心跳超 15s 或进程崩溃） | Waiting（可重新开局） |
-| 任意非 Destroyed | 房间销毁 | 房主离开(空房) / Lobby 回收 | Destroyed |
+| Finished | 重新开局 | 房主 POST start（**新 GameInstance**） | Starting |
+| Waiting/Finished | 玩家 join | 人数未满 | （房间不变） |
+| Running/Finished | 玩家 leave | （房间不变） | — |
+| 任意非 Destroyed | **最后一人** leave | `room_players` 空 | Destroyed |
+| 任意非 Destroyed | 实例异常 | watchdog 判定（心跳超 15s / 进程崩溃） | Waiting（可重新开局） |
+| 任意非 Destroyed | 房主 leave | 提早加入者为新 host；空房 → Destroyed | （详见 `room_lifecycle.md` §6） |
 
 不变量：
 
-- 只有 `Waiting` 和 `Finished` 状态允许玩家加入/离开。
-- 只有 `Waiting` 和 `Finished` 状态允许房主 start。
-- `Starting` / `Running` 期间不可重复 start，不可加入。
+- **房间 ≠ 一局游戏**：房间可经历多轮 `Waiting → Starting → Running → Finished → Starting → …`。
+- 只有 `Waiting` 状态允许 `POST /api/rooms/:id/join`（多局中途不接收新玩家）。
+- `Waiting` 和 `Finished` 状态允许房主 start；`Running` 期间不可重复 start。
+- `leave` 在任何非 `Destroyed` 状态都允许；只有"最后一人离开"才进 `Destroyed`。
+- 任何非 `Destroyed` 房间的 `rooms.host_uid` 必指向 `room_players` 里一名在房玩家（leave handler 保证）。
+
+完整设计见 `docs/room_lifecycle.md`（含 host 禅让策略、GameInstance 状态机、失败恢复、下一周期路线）。
 
 ### 1.2 GameInstance 状态机
 
@@ -128,7 +134,7 @@ Connection（短暂，一次连接）：
 - 每个 Player 最多绑定一个活跃 Connection；新连接 `bound` 会替换旧 Connection（关闭旧的）。
 - 断线只关 socket，不清 Player。
 - 重连验证成功后，新 Connection `bound` 到原 Player，并推送完整 `snapshot`。
-- **会话校验**：login/reconnect 提交的 `session` 必须与 Lobby 在 `LobbyInit.players[*].session` 中传入的 token 匹配，否则 Game 返回 `error:INVALID_SESSION` 并关闭连接。
+- **会话校验**：login/reconnect 提交的 `session` 必须与 Lobby 在 `LobbyInit.players[*].sessions` 中传入的某个 token 匹配（一个用户可能持有多个未过期 token —— 比如在另一个标签里重新登录过），否则 Game 返回 `error:INVALID_SESSION` 并关闭连接。Game 端按"任一匹配即可"校验。
 
 ### 1.4 Game 进程状态
 
@@ -242,7 +248,7 @@ Auth: Bearer <token>
 200: {"ok":true}
 ```
 
-若离开后房间无人，更新 `rooms.status='Destroyed'`。
+若离开的是**房主**且房间仍有其他玩家，Lobby 自动把 `joined_at` 最早的剩余玩家提为新房主（`UPDATE rooms SET host_uid = ...`），保证房间始终有房主。若房间变空，更新 `rooms.status='Destroyed'`。
 
 #### 2.1.9 开始游戏（需鉴权，仅房主）
 
@@ -286,7 +292,7 @@ Auth: Bearer <token>
 #### 2.2.1 初始化（stdin 首行）
 
 ```json
-{"room_id":1001,"game_type":"tictactoe","listen":"127.0.0.1:41001","players":[{"uid":1,"session":"<token>"},{"uid":2,"session":"<token>"}]}
+{"room_id":1001,"game_type":"tictactoe","listen":"127.0.0.1:41001","players":[{"uid":1,"sessions":["<token-a>","<token-b>"]},{"uid":2,"sessions":["<token>"]}]}
 ```
 
 字段见 `docs/protocol_spec.md` §1.3（PlayerInit）；`listen` 固定为 `127.0.0.1:<port>`（仅回环，Game 不对外暴露）。
@@ -338,8 +344,8 @@ Auth: Bearer <token>
 
 | type | 说明 |
 | --- | --- |
-| login | 首次登录（连接后首条必须为 login 或 reconnect）；session 必须匹配 `LobbyInit.players[*].session` |
-| reconnect | 断线重连，需之前登录过该局 |
+| login | 首次登录（连接后首条必须为 login 或 reconnect）；session 必须匹配 `LobbyInit.players[*].sessions` 中的任一 token |
+| reconnect | 断线重连，需之前登录过该局；session 校验同 login |
 | ping | 保活，Game 回 pong |
 | game | 游戏操作，data 由具体游戏定义 |
 
@@ -383,7 +389,7 @@ V1 客户端只连 Lobby 单一端口，由 Lobby 透明转发到 Game。
 转发行为：
 
 - Lobby **不解析 game 信封**，仅做传输层字节转发。
-- Session 校验由 Game 端进行（与 `LobbyInit.players[*].session` 比对）；校验失败 → Game 发 `error:INVALID_SESSION` 并关闭连接。
+- Session 校验由 Game 端进行（与 `LobbyInit.players[*].sessions` 列表**任一匹配**即可）；校验失败 → Game 发 `error:INVALID_SESSION` 并关闭连接。
 - 断连：客户端 socket 关闭 → Lobby 关闭 Game 侧连接；Game 侧断开 → Lobby 关闭客户端连接。
 
 拓扑：
@@ -449,7 +455,8 @@ Client ──ws──► Lobby (:8192, 0.0.0.0) ──tcp/ws──► Game (:410
 
 | code | HTTP | 说明 |
 | --- | --- | --- |
-| INSTANCE_START_FAILED | 500 | 实例启动失败 |
+| INSTANCE_START_FAILED | 500 | 实例启动失败（spawn 异常/超时等，message 含 cause） |
+| GAME_BINARY_NOT_FOUND | 503 | `LOBBY_GAME_BIN` / `games.toml` 指定的 binary 不存在或无 PATH |
 | INSTANCE_ABNORMAL | 500 | 实例异常（心跳超时/崩溃） |
 | INSTANCE_NOT_READY | 409 | 实例未就绪（WS 代理拒绝转发） |
 | INSTANCE_NOT_FOUND | 404 | instance_id 不存在（WS 代理路由失败） |

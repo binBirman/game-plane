@@ -84,7 +84,7 @@ pub enum ActionOutcome {
 - 发 `ready` 事件
 - 周期发 `heartbeat`（5s）
 - 接受 WS 连接；首帧必须是 `login` 或 `reconnect`
-- 校验 session 对照 `LobbyInit.players[*].session`
+- 校验 session 对照 `LobbyInit.players[*].sessions`（**任一匹配即可**——用户可能在多个标签登录，每个未过期 token 都列在 `sessions` 里）
 - 路由 `ping → pong`、`game → handle_action`
 - 处理 stdin `cmd:start`、`cmd:stop`
 - 阶段切换、发 `finished` 等事件给 Lobby
@@ -118,7 +118,7 @@ Lobby 在 spawn game 时把配置塞进 init：
   "room_id": 42,
   "game_type": "<game-A-type>",
   "listen": "127.0.0.1:41001",
-  "players": [{"uid":1,"session":"..."}],
+  "players": [{"uid":1,"sessions":["..."]}],
   "config": { /* 由游戏决定；Lobby 透传 */ }
 }
 ```

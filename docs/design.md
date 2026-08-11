@@ -251,7 +251,7 @@ stdin / stdout，每行一个 JSON 对象（`\n` 分隔），UTF-8。
 初始化：Lobby 启动 Game 进程时，将初始化 JSON 作为 stdin 首行写入：
 
 ```json
-{"room_id":1001,"game_type":"tictactoe","listen":"127.0.0.1:41001","players":[{"uid":1,"session":"xxxx"}]}
+{"room_id":1001,"game_type":"tictactoe","listen":"127.0.0.1:41001","players":[{"uid":1,"sessions":["xxxx"]}]}
 ```
 
 `listen` 固定为 `127.0.0.1:<port>`，Game 不暴露公网。
