@@ -148,6 +148,51 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Orphan instance sweep: a previous lobby may have died mid-game, leaving
+    // `game_instances.status IN ('starting','ready','running')` rows whose
+    // sub-process is long gone and `rooms.status='Running'` without a live
+    // instance. Mark them abnormal; if their room is still 'Running', roll
+    // it back to 'Waiting' so the host can re-start.
+    {
+        let db = db.clone();
+        match sqlx::query(
+            "UPDATE game_instances
+             SET status = 'abnormal', end_time = datetime('now')
+             WHERE status IN ('starting','ready','running')",
+        )
+        .execute(&db)
+        .await
+        {
+            Ok(r) => {
+                let n = r.rows_affected();
+                if n > 0 {
+                    tracing::warn!(orphans = n, "orphaned game_instances marked abnormal at startup");
+                    // Roll any rooms that pointed to live-running state back
+                    // to 'Waiting' so they're playable again. We use the
+                    // existence of an instance row that's now abnormal as
+                    // the signal; only flip Running rooms (Finished is fine).
+                    let r2 = sqlx::query(
+                        "UPDATE rooms
+                         SET status = 'Waiting'
+                         WHERE status = 'Running'
+                           AND EXISTS (
+                             SELECT 1 FROM game_instances
+                             WHERE game_instances.room_id = rooms.room_id
+                               AND game_instances.status = 'abnormal'
+                               AND game_instances.end_time IS NOT NULL
+                           )",
+                    )
+                    .execute(&db)
+                    .await;
+                    if let Ok(r2) = r2 {
+                        tracing::info!(rooms = r2.rows_affected(), "rooms rolled back to Waiting");
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "orphan sweep failed"),
+        }
+    }
+
     let app = router::build(state)
         .layer(TraceLayer::new_for_http())
         .layer(axum::middleware::from_fn(http::request_id::middleware));
