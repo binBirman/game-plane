@@ -12,6 +12,7 @@ pub fn build(state: SharedState) -> Router {
     Router::new()
         .route("/api/register", post(user::register))
         .route("/api/login", post(user::login))
+        .route("/api/logout", post(user::logout))
         .route("/api/captcha/challenge", post(captcha::issue))
         .route("/api/games", get(room::games))
         .route("/api/rooms", get(room::list).post(room::create))

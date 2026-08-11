@@ -168,3 +168,30 @@ pub async fn login(
     .instrument(span)
     .await
 }
+
+pub async fn logout(
+    State(state): State<SharedState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // No CurrentUser here — we want to revoke the *current* token even if it's
+    // already expired/invalid, so that subsequent /api/* calls (which would
+    // re-use the same browser storage) get 401 and the frontend clears state.
+    // We also accept a missing header as "already gone" -> 200 (idempotent).
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|s| s.trim().to_string());
+
+    let Some(token) = token else {
+        return Ok(Json(serde_json::json!({"ok": true})));
+    };
+
+    let res = sqlx::query("DELETE FROM sessions WHERE token = ?")
+        .bind(&token)
+        .execute(&state.db)
+        .await
+        .map_err(|e| ApiError::Internal(anyhow::Error::from(e)))?;
+    tracing::info!(deleted = res.rows_affected(), "logout");
+    Ok(Json(serde_json::json!({"ok": true})))
+}
