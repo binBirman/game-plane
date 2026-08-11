@@ -92,6 +92,32 @@ input, select {
 }
 input:focus, select:focus { outline: none; border-color: var(--accent); }
 
+/* Password input wrapper with show/hide toggle. The button overlays the
+ * right edge of the input and is keyboard-accessible (tab order matches
+ * document flow). */
+.pwd-wrap {
+    position: relative;
+    display: grid;
+}
+.pwd-wrap input { padding-right: 38px; }
+.pwd-toggle {
+    position: absolute;
+    right: 4px;
+    top: 50%;
+    transform: translateY(-50%);
+    background: transparent;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+    padding: 4px 8px;
+    border-radius: 6px;
+    line-height: 1;
+    font-size: 13px;
+    user-select: none;
+}
+.pwd-toggle:hover { color: var(--text); background: var(--card-2); }
+.pwd-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
 button.primary {
     background: var(--accent);
     color: #0a0a10;
@@ -212,6 +238,79 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .toast.error { border-color: var(--error); }
 .toast.ok { border-color: var(--ok); }
 .hidden { display: none !important; }
+
+/* Game-over modal */
+.modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.55);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+}
+.modal {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 28px 32px;
+    min-width: 320px;
+    max-width: 480px;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+    text-align: center;
+}
+.modal h2 {
+    margin: 0 0 8px;
+    font-size: 22px;
+    letter-spacing: -0.01em;
+}
+.modal h2.win { color: var(--ok); }
+.modal h2.lose { color: var(--error); }
+.modal h2.draw { color: var(--warn); }
+.modal p {
+    margin: 0 0 20px;
+    color: var(--muted);
+    font-size: 14px;
+}
+.modal .final-board {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 4px;
+    width: 180px;
+    margin: 0 auto 20px;
+}
+.modal .final-board .cell {
+    aspect-ratio: 1;
+    background: var(--card-2);
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 22px;
+    font-weight: 600;
+}
+.modal .final-board .cell.x { color: var(--accent); }
+.modal .final-board .cell.o { color: var(--warn); }
+.modal-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: center;
+}
+.modal-actions button {
+    padding: 8px 20px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--card-2);
+    color: var(--text);
+    cursor: pointer;
+    font-size: 14px;
+}
+.modal-actions button.primary {
+    background: var(--accent);
+    color: #0c1322;
+    border-color: transparent;
+    font-weight: 600;
+}
 
 .row { display: flex; gap: 8px; align-items: center; }
 .spacer { flex: 1; }

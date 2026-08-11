@@ -17,6 +17,20 @@
     </header>
     <main id="app"></main>
     <div id="toast" class="toast" role="status" aria-live="polite" aria-atomic="true"></div>
+
+    <!-- Game-over modal: shown when game reaches phase=finished. -->
+    <div id="game-over-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="game-over-title">
+        <div class="modal">
+            <h2 id="game-over-title">游戏结束</h2>
+            <p id="game-over-detail"></p>
+            <div id="game-over-final" class="final-board"></div>
+            <div class="modal-actions">
+                <button id="game-over-again" class="hidden">再来一局</button>
+                <button class="primary" id="game-over-back">返回房间</button>
+            </div>
+        </div>
+    </div>
+
     <script src="/app.js"></script>
 </body>
 </html>

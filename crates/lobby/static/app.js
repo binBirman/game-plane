@@ -15,6 +15,9 @@
         roomPollRoomId: 0,
         roomLastFetchAt: 0,
         knownGames: new Map(),
+        // The room_id of the page the user is currently inside. Tracked so
+        // the game-over modal can route back to #room/<id> (not #lobby).
+        currentRoomId: 0,
     };
 
     // ─── game metadata (frontend cache of /api/games) ────────────────
@@ -216,12 +219,13 @@
 
         const loginForm = el("form", { class: "card", id: "form-login", novalidate: true, onsubmit: handleLogin }, [
             fieldGroup("用户名", el("input", { name: "username", required: true, autocomplete: "username" })),
-            fieldGroup("密码", el("input", { name: "password", type: "password", required: true, autocomplete: "current-password" })),
+            fieldGroup("密码", passwordInput("password", "current-password")),
             el("button", { class: "primary", type: "submit" }, "登录"),
         ]);
         const registerForm = el("form", { class: "card hidden", id: "form-register", novalidate: true, onsubmit: handleRegister }, [
             fieldGroup("用户名", el("input", { name: "username", required: true, autocomplete: "username" }), "3-20 字符"),
-            fieldGroup("密码", el("input", { name: "password", type: "password", required: true, minlength: "9", autocomplete: "new-password" }), "≥9 位，含数字/字母/特殊字符"),
+            fieldGroup("密码", passwordInput("password", "new-password"), "至少 8 位"),
+            fieldGroup("确认密码", passwordInput("password_confirm", "new-password"), "再次输入密码，必须一致"),
             fieldGroup("昵称", el("input", { name: "nickname", required: true })),
             el("button", { class: "primary", type: "submit" }, "创建账号"),
         ]);
@@ -229,21 +233,48 @@
         app.appendChild(registerForm);
     }
 
-    function fieldGroup(label, input, hint) {
-        const id = input.getAttribute("name");
+    function fieldGroup(label, inputOrWrap, hint) {
+        // The wrapped password field is a `<div class="pwd-wrap">`; pull
+        // the inner input so error binding still works.
+        const input = inputOrWrap.matches?.("input")
+            ? inputOrWrap
+            : inputOrWrap.querySelector("input");
+        const id = input?.getAttribute("name") || "";
         const errorSlot = el("div", { class: "field-error", "data-error-for": id, role: "alert" });
         const wrap = el("label", { class: "field-group" }, [
             label,
-            input,
+            inputOrWrap,
             hint ? el("div", { class: "field-hint" }, hint) : null,
             errorSlot,
         ]);
         // Mark invalid + clear as user types.
-        input.addEventListener("input", () => {
+        if (input) input.addEventListener("input", () => {
             input.classList.remove("invalid");
             errorSlot.textContent = "";
         });
         return wrap;
+    }
+
+    // Password input wrapped with a show/hide toggle button. Toggle swaps
+    // `type` between "password" and "text" and updates the label. Plain text
+    // (no emoji — see docs/frontend-design.md §5) so the affordance reads
+    // the same on every OS.
+    function passwordInput(name, autocomplete) {
+        const input = el("input", { name, type: "password", required: true, autocomplete });
+        const btn = el("button", {
+            type: "button",
+            class: "pwd-toggle",
+            "aria-label": "显示密码",
+            "aria-pressed": "false",
+            onclick: () => {
+                const show = input.type === "password";
+                input.type = show ? "text" : "password";
+                btn.textContent = show ? "隐藏" : "显示";
+                btn.setAttribute("aria-label", show ? "隐藏密码" : "显示密码");
+                btn.setAttribute("aria-pressed", show ? "true" : "false");
+            },
+        }, "显示");
+        return el("div", { class: "pwd-wrap" }, [input, btn]);
     }
 
     function setFieldError(form, name, message) {
@@ -276,11 +307,13 @@
                 setFieldError(form, "username", "用户名需 3-20 字符");
                 ok = false;
             }
-            if (password.length < 9) {
-                setFieldError(form, "password", "密码至少 9 位");
+            if (password.length < 8) {
+                setFieldError(form, "password", "密码至少 8 位");
                 ok = false;
-            } else if (!/[0-9]/.test(password) || !/[a-zA-Z]/.test(password) || !/[^a-zA-Z0-9]/.test(password)) {
-                setFieldError(form, "password", "需包含数字、字母、特殊字符");
+            }
+            const passwordConfirm = fd.get("password_confirm") || "";
+            if (password !== passwordConfirm) {
+                setFieldError(form, "password_confirm", "两次输入的密码不一致");
                 ok = false;
             }
             const nickname = (fd.get("nickname") || "").trim();
@@ -523,6 +556,7 @@
 
     async function renderRoom(roomId) {
         stopRoomPolling();
+        state.currentRoomId = roomId;
         $("#topbar").classList.remove("hidden");
         $("#user-info").textContent = `${state.nickname} (#${state.uid})`;
         const app = $("#app");
@@ -889,6 +923,9 @@
     let gameWs = null;
 
     function renderGame(instanceId) {
+        // Keep currentRoomId so the game-over modal can route back to #room/<id>.
+        // If the user navigated directly to #game/<id> without going through a
+        // room, this stays 0 and the modal falls back to #lobby.
         $("#topbar").classList.remove("hidden");
         $("#user-info").textContent = `${state.nickname} (#${state.uid})`;
         const app = $("#app");
@@ -956,18 +993,19 @@
                 boardState = msg.state;
                 $("#board").classList.remove("hidden");
                 renderBoard();
-                status.textContent = boardState.phase === "playing" ? "游戏进行中" : "等待开始";
-                status.className = "subtitle status-bar connected";
+                if (boardState.phase === "finished") {
+                    showGameOver(boardState);
+                } else {
+                    status.textContent = boardState.phase === "playing" ? "游戏进行中" : "等待开始";
+                    status.className = "subtitle status-bar connected";
+                }
                 break;
             case "game":
                 if (msg.data && msg.data.state) {
                     boardState = msg.data.state;
                     renderBoard();
                     if (boardState.phase === "finished") {
-                        status.textContent = boardState.winner
-                            ? `游戏结束，胜者 uid=${boardState.winner}`
-                            : "平局";
-                        status.className = "subtitle status-bar";
+                        showGameOver(boardState);
                     }
                 }
                 break;
@@ -997,6 +1035,62 @@
         if (boardState.phase === "playing") {
             status.textContent = boardState.turn === myUid ? "轮到你" : `等待 uid=${boardState.turn} 操作`;
         }
+    }
+
+    function showGameOver(state) {
+        const modal = $("#game-over-modal");
+        if (!modal) return;
+        const title = $("#game-over-title");
+        const detail = $("#game-over-detail");
+        const finalBoard = $("#game-over-final");
+        const againBtn = $("#game-over-again");
+        const seatLabel = (uid) => {
+            const idx = (state.players || []).indexOf(uid);
+            return idx === 0 ? "X" : (idx === 1 ? "O" : `uid=${uid}`);
+        };
+        if (state.winner) {
+            const iWon = state.winner === myUid;
+            title.textContent = iWon ? "胜利！" : "失败";
+            title.className = iWon ? "win" : "lose";
+            const winnerSeat = seatLabel(state.winner);
+            detail.textContent = iWon
+                ? `${winnerSeat}（你）获胜`
+                : `${winnerSeat} 获胜`;
+        } else {
+            title.textContent = "平局";
+            title.className = "draw";
+            detail.textContent = "棋盘已满，势均力敌";
+        }
+        // Final board snapshot.
+        finalBoard.innerHTML = "";
+        const board = state.board || [];
+        for (let i = 0; i < board.length; i++) {
+            const v = board[i];
+            const cell = el("div", { class: "cell" }, "");
+            if (v && v !== 0) {
+                cell.textContent = seatLabel(v);
+                cell.classList.add(v === myUid ? "x" : "o");
+            }
+            finalBoard.appendChild(cell);
+        }
+        // "再来一局" button is only meaningful for the host of the current
+        // room. We need currentRoomId (set by renderRoom) and host_uid (from
+        // roomCache). The host is identified by uid match, not by the WS.
+        const roomId = state.currentRoomId;
+        const cached = roomId ? state.roomCache.get(roomId) : null;
+        const isHost = !!(cached && cached.host_uid === myUid);
+        if (againBtn) {
+            againBtn.classList.toggle("hidden", !(isHost && roomId));
+            againBtn.disabled = false;
+        }
+        modal.classList.remove("hidden");
+        // Stop accepting further moves on the underlying board.
+        try { gameWs && gameWs.close(); } catch {}
+    }
+
+    function hideGameOver() {
+        const modal = $("#game-over-modal");
+        if (modal) modal.classList.add("hidden");
     }
 
     function seatMark(uid) {
@@ -1051,6 +1145,27 @@
     window.addEventListener("hashchange", render);
     document.addEventListener("DOMContentLoaded", () => {
         $("#logout").addEventListener("click", (e) => { e.preventDefault(); logout(); });
+        // Modal buttons: route back to the room we came from (not #lobby), so
+        // a multi-game room stays alive between rounds. If we got here without
+        // ever visiting a room (deep-link to #game/<id>), fall back to #lobby.
+        const back = $("#game-over-back");
+        if (back) {
+            back.addEventListener("click", () => {
+                hideGameOver();
+                location.hash = state.currentRoomId ? `#room/${state.currentRoomId}` : "#lobby";
+            });
+        }
+        // "再来一局" — host-only; calls startGame(currentRoomId) which POSTs
+        // /api/rooms/<id>/start. The lobby transitions Finished → Starting.
+        const again = $("#game-over-again");
+        if (again) {
+            again.addEventListener("click", async () => {
+                if (!state.currentRoomId) return;
+                again.disabled = true;
+                hideGameOver();
+                await startGame(state.currentRoomId);
+            });
+        }
         render();
     });
 })();
