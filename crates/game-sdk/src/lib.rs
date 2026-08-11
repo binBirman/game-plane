@@ -369,8 +369,14 @@ async fn handle_socket<L: GameLogic>(
         }
     }
 
-    outbound.abort();
+    // Inbound loop ended. Drop the channel's sender halves so the outbound
+    // pump's `rx.recv()` returns `None` and it drains naturally. Aborting
+    // the pump here would race with `broadcast_snapshot` — the last
+    // game-over snapshot is queued via `tx.send()` and can be lost if the
+    // pump is killed before flushing it onto the wire.
+    drop(tx);
     cleanup(&registry, uid).await;
+    let _ = outbound.await;
 }
 
 async fn cleanup(registry: &ConnRegistry, uid: i64) {
