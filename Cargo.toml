@@ -5,6 +5,7 @@ members = [
     "crates/lobby",
     "crates/game-sdk",
     "crates/games/tictactoe",
+    "crates/games/take_your_position",
 ]
 
 [workspace.package]

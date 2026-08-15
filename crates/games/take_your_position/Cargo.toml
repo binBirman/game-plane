@@ -1,0 +1,29 @@
+[package]
+name = "take_your_position"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "take_your_position"
+path = "src/main.rs"
+
+[dependencies]
+game-sdk = { path = "../../game-sdk" }
+protocol = { path = "../../protocol" }
+
+tokio = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+async-trait = "0.1"
+
+rand = "0.9"
+
+tracing = { workspace = true }
+
+anyhow = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"
