@@ -875,6 +875,24 @@ button.confirm:hover { background: #ef4444; }
     font-weight: 700;
     font-size: 15px;
     flex-shrink: 0;
+    position: relative;
+}
+/* Offline: grayscale avatar + centered lightning bolt overlay. */
+.seat-panel.is-offline .avatar {
+    filter: grayscale(1);
+    opacity: 0.6;
+}
+.seat-panel.is-offline .avatar::after {
+    content: "⚡";
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 22px;
+    color: var(--warn);
+    filter: none;
+    opacity: 1;
 }
 .seat-info { flex: 1; min-width: 0; }
 .seat-name { font-weight: 600; font-size: 14px; line-height: 1.2; }

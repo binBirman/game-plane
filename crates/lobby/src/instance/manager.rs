@@ -197,13 +197,38 @@ impl InstanceManager {
                     }
                     Ok(GameEvent::Finished { result }) => {
                         info!(instance_id, ?result, "game finished");
+                        let room_id = h_room_id(&g, instance_id);
                         if let Some(h) = g.get_mut(&instance_id) {
                             h.status = Status::Finished;
                         }
                         let _ = sqlx::query("UPDATE game_instances SET status='finished', end_time=datetime('now') WHERE instance_id=?")
                             .bind(instance_id).execute(&db).await;
                         let _ = sqlx::query("UPDATE rooms SET status='Finished' WHERE room_id=?")
-                            .bind(h_room_id(&g, instance_id)).execute(&db).await;
+                            .bind(room_id).execute(&db).await;
+                        // Drop players whose WS was still down when the game ended
+                        // (their room membership expires automatically).
+                        if let Some(online) = result.get("online").and_then(|v| v.as_array()) {
+                            let online_uids: Vec<i64> = online.iter().filter_map(|v| v.as_i64()).collect();
+                            let members: Vec<i64> = sqlx::query_scalar(
+                                "SELECT uid FROM room_players WHERE room_id=?",
+                            )
+                            .bind(room_id)
+                            .fetch_all(&db)
+                            .await
+                            .unwrap_or_default();
+                            for uid in members {
+                                if !online_uids.contains(&uid) {
+                                    let _ = sqlx::query(
+                                        "DELETE FROM room_players WHERE room_id=? AND uid=?",
+                                    )
+                                    .bind(room_id)
+                                    .bind(uid)
+                                    .execute(&db)
+                                    .await;
+                                    tracing::info!(room_id, uid, "player auto-removed (offline at game end)");
+                                }
+                            }
+                        }
                         // Reap child + drop instance record.
                         drop(g);
                         if let Some(mut c) = child_for_reader.lock().await.take() {

@@ -12,10 +12,14 @@ use serde_json::{json, Value};
 
 use crate::event::Event;
 use crate::rules::{build_players, RuleError};
-use crate::state::{GameState, Phase};
+use crate::state::{GameState, Phase, StepTimers};
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
-pub struct TakeYourPositionConfig;
+pub struct TakeYourPositionConfig {
+    /// "30+60" | "40+120" | "60+180" (injected by lobby from rooms.timer_preset).
+    #[serde(default)]
+    pub timer_preset: Option<String>,
+}
 
 pub struct TakeYourPosition {
     state: GameState,
@@ -28,7 +32,7 @@ pub struct TakeYourPosition {
 impl GameLogic for TakeYourPosition {
     type Config = TakeYourPositionConfig;
 
-    fn new(players: &[PlayerInit], _config: &Self::Config) -> Self {
+    fn new(players: &[PlayerInit], config: &Self::Config) -> Self {
         // Shuffle the seating so the round is random each game.
         let mut uids: Vec<i64> = players.iter().map(|p| p.uid).collect();
         uids.shuffle(&mut rng());
@@ -37,6 +41,8 @@ impl GameLogic for TakeYourPosition {
             .map(|p| (p.uid, p.sessions.clone()))
             .collect::<Vec<_>>();
         let mut state = GameState::new(build_players(&uids));
+        state.timers = Some(StepTimers::from_preset(config.timer_preset.as_deref()));
+        state.refresh_deadline();
         state.deal();
         Self {
             state,
@@ -217,6 +223,7 @@ impl GameLogic for TakeYourPosition {
                     let yes_count = self.state.players.iter().filter(|p| p.restart_yes).count();
                     if yes_count == self.state.players.len() && self.is_over() {
                         self.state.deal();
+                        self.state.refresh_deadline();
                         self.pending_events.push(Event::PhaseChanged {
                             phase: self.state.phase.name().into(),
                         });
@@ -246,6 +253,72 @@ impl GameLogic for TakeYourPosition {
     fn min_players(&self) -> usize { 5 }
     fn max_players(&self) -> usize { 5 }
     fn game_name(&self) -> &'static str { "TYP · Take Your Position" }
+
+    /// Step-timer enforcement: when the phase deadline passes, auto-proxy the
+    /// affected players (skip prediction / play first card) so the game doesn't
+    /// stall waiting on an absent player.
+    fn tick(&mut self) {
+        if !self.state.deadline_passed() {
+            return;
+        }
+        // Advance deadline past now so we don't re-fire immediately after a proxy.
+        // We'll refresh when the phase advances below.
+        self.state.deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
+
+        let mut acted = false;
+        match self.state.phase {
+            Phase::PriorPrediction => {
+                // Auto-skip (放弃) any player who hasn't predicted yet.
+                let pending: Vec<i64> = self
+                    .state
+                    .players
+                    .iter()
+                    .filter(|p| !p.has_predicted)
+                    .map(|p| p.uid)
+                    .collect();
+                for uid in pending {
+                    if let Ok(ev) = self.state.apply_predict(uid, None) {
+                        self.pending_events.extend(ev);
+                        acted = true;
+                    }
+                }
+            }
+            Phase::Play => {
+                // Auto-play the first card for anyone who hasn't committed.
+                let pending: Vec<i64> = self
+                    .state
+                    .players
+                    .iter()
+                    .filter(|p| p.committed_card.is_none())
+                    .map(|p| p.uid)
+                    .collect();
+                for uid in pending {
+                    if let Ok(ev) = self.state.apply_play_card(uid, 0) {
+                        self.pending_events.extend(ev);
+                        acted = true;
+                    }
+                }
+            }
+            Phase::PosteriorPrediction => {
+                // Auto-skip posterior if the first player hasn't submitted.
+                let sp = self.state.start_player;
+                let uid = self.state.players[sp].uid;
+                if self.state.players[sp].posterior_prediction.is_none() {
+                    if let Ok(ev) = self.state.apply_posterior(uid, Vec::new()) {
+                        self.pending_events.extend(ev);
+                        acted = true;
+                    }
+                }
+            }
+            Phase::End => {}
+        }
+
+        if acted {
+            let mut events = Vec::new();
+            self.advance_phase(&mut events);
+            self.pending_events.extend(events);
+        }
+    }
 }
 
 impl TakeYourPosition {
@@ -293,6 +366,7 @@ impl TakeYourPosition {
                 }
                 self.state.phase = Phase::Play;
                 self.state.current_player = None; // simultaneous
+                self.state.refresh_deadline();
                 events.push(Event::PhaseChanged { phase: Phase::Play.name().into() });
             }
             Phase::Play => {
@@ -304,6 +378,7 @@ impl TakeYourPosition {
                 // table and history stays stale until the posterior is committed.
                 self.state.phase = Phase::PosteriorPrediction;
                 self.state.current_player = Some(self.state.start_player);
+                self.state.refresh_deadline();
                 events.push(Event::PhaseChanged { phase: Phase::PosteriorPrediction.name().into() });
             }
             Phase::PosteriorPrediction => {
@@ -318,6 +393,7 @@ impl TakeYourPosition {
                 self.state.round += 1;
                 if self.state.round >= 5 {
                     self.state.phase = Phase::End;
+                    self.state.deadline = None;
                     events.push(Event::PhaseChanged { phase: Phase::End.name().into() });
                 } else {
                     self.state.begin_next_round();

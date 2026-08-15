@@ -430,12 +430,28 @@
         const createCard = el("div", { class: "card" }, [
             el("h2", { style: "margin:0;font-size:15px;color:var(--muted)" }, "创建房间"),
             el("div", { class: "row" }, [
-                el("select", { id: "game-type" }, gameOptions),
+                el("select", { id: "game-type", onchange: onGameTypeChange }, gameOptions),
                 el("div", { class: "spacer" }),
                 el("button", { class: "primary", onclick: createRoom }, "创建"),
             ]),
+            // Step-limit selection (only for TYP games).
+            el("div", { id: "timer-row", class: "row hidden", style: "margin-top:10px" }, [
+                el("label", { style: "margin-right:8px" }, "限时"),
+                el("select", { id: "timer-preset" }, [
+                    el("option", { value: "30+60" }, "快速（30+60）"),
+                    el("option", { value: "40+120", selected: true }, "标准（40+120）"),
+                    el("option", { value: "60+180" }, "宽松（60+180）"),
+                ]),
+                el("span", { class: "muted", style: "font-size:12px;margin-left:8px" },
+                    "快速/标准=每轮计时；宽松=整局共享"),
+            ]),
         ]);
         app.appendChild(createCard);
+
+        function onGameTypeChange() {
+            const v = $("#game-type").value;
+            $("#timer-row").classList.toggle("hidden", v !== "take_your_position");
+        }
 
         app.appendChild(el("h2", { style: "margin:24px 0 8px;font-size:15px;color:var(--muted)" }, "现有房间"));
         const list = el("div", { class: "room-list", id: "room-list" }, [renderRoomListSkeleton()]);
@@ -494,8 +510,13 @@
 
     async function createRoom() {
         const gt = $("#game-type").value;
+        const body = { game_type: gt };
+        const timerRow = $("#timer-row");
+        if (timerRow && !timerRow.classList.contains("hidden")) {
+            body.timer_preset = $("#timer-preset").value;
+        }
         try {
-            const r = await api("/api/rooms", { game_type: gt });
+            const r = await api("/api/rooms", body);
             toast("房间已创建", "ok");
             location.hash = "#room/" + r.room_id;
         } catch (e) { toast(e.message, "error"); }
@@ -1107,6 +1128,10 @@
         const panel = el("div", { class: "seat-panel" + (isSelf ? " is-self" : "") });
         if (s.start_player === uid) panel.classList.add("is-first-player");
         if (s.current_player === uid) panel.classList.add("is-active");
+        // Offline if `s.online` exists and doesn't include this uid.
+        if (Array.isArray(s.online) && !s.online.includes(uid)) {
+            panel.classList.add("is-offline");
+        }
 
         const header = el("div", { class: "seat-panel-header" });
         header.appendChild(el("div", { class: "avatar", style: `background: ${avatarColor}` }, avatarChar));

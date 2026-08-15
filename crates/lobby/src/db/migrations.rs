@@ -28,5 +28,13 @@ pub async fn run(pool: &SqlitePool) -> Result<()> {
         .execute(pool)
         .await;
 
+    // Indexes on the just-added columns (must run after ALTER).
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_room_players_online ON room_players(online)")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_instances_action ON game_instances(last_action_at)")
+        .execute(pool)
+        .await;
+
     Ok(())
 }

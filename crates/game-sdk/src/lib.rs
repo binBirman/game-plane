@@ -101,6 +101,13 @@ pub trait GameLogic: Send + Sync + 'static {
     fn game_name(&self) -> &'static str {
         "Game"
     }
+
+    /// Called roughly every second while the game is running. Games with a
+    /// step timer (timeout → auto-skip / auto-play) implement this to check
+    /// deadlines and apply proxy actions. Default: no-op.
+    fn tick(&mut self) {
+        // default no-op
+    }
 }
 
 /// 启动游戏：读 stdin init → 解析 config → bind WS → 发 ready → 跑事件循环。
@@ -140,6 +147,20 @@ pub async fn run<L: GameLogic>(init: LobbyInit) -> anyhow::Result<()> {
             println!("{{\"event\":\"heartbeat\"}}");
         }
     });
+
+    // Game-logic tick: lets games enforce step timeouts (auto-skip / auto-play)
+    // even when no player sends an action. Runs every second.
+    {
+        let logic = logic.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tick.tick().await;
+                let mut g = logic.lock().await;
+                g.tick();
+            }
+        });
+    }
 
     // Stdin cmd reader
     tokio::spawn(async move {
@@ -325,8 +346,10 @@ async fn handle_socket<L: GameLogic>(
         return;
     }
 
-    // Initial snapshot (per-viewer)
+    // Initial snapshot (per-viewer), with `online` set from the registry.
     let initial = logic.lock().await.snapshot(Some(uid));
+    let online: Vec<i64> = registry.lock().await.keys().copied().collect();
+    let initial = inject_online(initial, online);
     if send_msg(&mut sender, &ServerMsg::Snapshot { state: initial })
         .await
         .is_err()
@@ -374,7 +397,7 @@ async fn handle_socket<L: GameLogic>(
                         ActionOutcome::GameOver => {
                             let _ = game_over; // suppress unused_assignments (loop exits via `break`)
                             println!("{{\"event\":\"action\"}}"); // even final move keeps it alive
-                            println!("{{\"event\":\"finished\"}}");
+                            println_online_finished(&registry).await;
                             broadcast_snapshot(&logic, &registry).await;
                             break;
                         }
@@ -383,7 +406,7 @@ async fn handle_socket<L: GameLogic>(
                     let over = logic.lock().await.is_over();
                     if over {
                         let _ = game_over;
-                        println!("{{\"event\":\"finished\"}}");
+                        println_online_finished(&registry).await;
                         broadcast_snapshot(&logic, &registry).await;
                         break;
                     }
@@ -420,6 +443,14 @@ async fn cleanup(registry: &ConnRegistry, uid: i64) {
     r.remove(&uid);
 }
 
+/// Emit `{"event":"finished","result":{"online":[...]}}` so the lobby can drop
+/// players whose WS is still down when the game ends.
+async fn println_online_finished(registry: &ConnRegistry) {
+    let online: Vec<i64> = registry.lock().await.keys().copied().collect();
+    let result = serde_json::json!({ "online": online });
+    println!("{{\"event\":\"finished\",\"result\":{result}}}");
+}
+
 async fn broadcast_snapshot<L: GameLogic>(
     logic: &Arc<Mutex<L>>,
     registry: &ConnRegistry,
@@ -428,8 +459,9 @@ async fn broadcast_snapshot<L: GameLogic>(
     let pending: Vec<(i64, Value)> = {
         let g = logic.lock().await;
         let r = registry.lock().await;
+        let online: Vec<i64> = r.keys().copied().collect();
         r.keys()
-            .map(|uid| (*uid, g.snapshot(Some(*uid))))
+            .map(|uid| (*uid, inject_online(g.snapshot(Some(*uid)), online.clone())))
             .collect()
     };
     for (uid, snap) in pending {
@@ -437,6 +469,17 @@ async fn broadcast_snapshot<L: GameLogic>(
             let _ = tx.send(ServerMsg::Snapshot { state: snap }).await;
         }
     }
+}
+
+/// Add the `online` (list of uids with a live WS) to a snapshot object.
+/// Snapshot is a JSON object; we insert `online` if the key isn't already set.
+fn inject_online(mut snap: Value, online: Vec<i64>) -> Value {
+    if let Value::Object(ref mut m) = snap {
+        if !m.contains_key("online") {
+            m.insert("online".to_string(), serde_json::to_value(online).unwrap_or(Value::Array(vec![])));
+        }
+    }
+    snap
 }
 
 async fn send_msg(

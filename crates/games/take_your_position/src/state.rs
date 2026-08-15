@@ -58,6 +58,34 @@ pub struct PlayerState {
     pub played_history: Vec<Card>,
 }
 
+/// Step timer budget. `per_round` == true → reset each round; false → the
+/// budget is shared across the whole game (global countdown).
+#[derive(Debug, Clone, Copy)]
+pub struct StepTimers {
+    pub per_round: bool,
+    pub predict_secs: u64,
+    pub play_secs: u64,
+}
+
+impl StepTimers {
+    /// Parse a timer preset like "30+60" | "40+120" | "60+180".
+    /// First number = prior-prediction budget, second = play budget.
+    /// Presets < 60s for play are treated as per-round; the 60+180 preset is
+    /// the global-shared one.
+    pub fn from_preset(preset: Option<&str>) -> Self {
+        let (predict, play, per_round) = match preset.unwrap_or("30+60").split('+').collect::<Vec<_>>()[..] {
+            [p, pl] => {
+                let p: u64 = p.trim().parse().unwrap_or(30);
+                let pl: u64 = pl.trim().parse().unwrap_or(60);
+                // 60+180 => global shared; others => per-round reset.
+                (p, pl, !(p == 60 && pl == 180))
+            }
+            _ => (30, 60, true),
+        };
+        Self { per_round, predict_secs: predict, play_secs: play }
+    }
+}
+
 #[derive(Debug)]
 pub struct GameState {
     pub players: Vec<PlayerState>,
@@ -77,6 +105,11 @@ pub struct GameState {
     /// `begin_next_round` so the per-snapshot event stream doesn't grow
     /// unbounded across rounds.
     pub pending_events: Vec<crate::event::Event>,
+
+    /// Step timers (None = no time limit).
+    pub timers: Option<StepTimers>,
+    /// Monotonic deadline for the current phase, if a timer is active.
+    pub deadline: Option<std::time::Instant>,
 }
 
 impl GameState {
@@ -90,6 +123,8 @@ impl GameState {
             current_player: Some(start_player),
             table: vec![],
             pending_events: Vec::new(),
+            timers: None,
+            deadline: None,
         }
     }
 
@@ -196,6 +231,45 @@ impl GameState {
         self.table.clear();
         self.pending_events.clear();
         self.phase = Phase::PriorPrediction;
+        self.refresh_deadline();
+    }
+
+    /// Set / keep the deadline for the current phase based on `timers`.
+    /// Per-round mode resets the deadline on every phase entry; global mode
+    /// keeps the first-set deadline across rounds.
+    pub fn refresh_deadline(&mut self) {
+        let Some(t) = self.timers else {
+            self.deadline = None;
+            return;
+        };
+        if t.per_round {
+            // Fresh budget each time we enter a phase.
+            self.deadline = self.phase_deadline();
+        } else {
+            // Global shared: keep whatever deadline was first set for this phase.
+            if self.deadline.is_none() {
+                self.deadline = self.phase_deadline();
+            }
+        }
+    }
+
+    fn phase_deadline(&self) -> Option<std::time::Instant> {
+        let t = self.timers?;
+        let secs = match self.phase {
+            Phase::PriorPrediction => t.predict_secs,
+            Phase::Play => t.play_secs,
+            Phase::PosteriorPrediction => t.play_secs, // reuse play budget for posterior
+            Phase::End => return None,
+        };
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(secs))
+    }
+
+    /// True if the current phase's deadline has passed.
+    pub fn deadline_passed(&self) -> bool {
+        match self.deadline {
+            Some(d) => std::time::Instant::now() >= d,
+            None => false,
+        }
     }
 
     /// Move every player's `committed_card` into `table` (revealed) and append

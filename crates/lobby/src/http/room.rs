@@ -23,7 +23,11 @@ pub struct CreateReq {
 }
 
 fn validate_timer_preset(p: &str) -> bool {
-    matches!(p, "30+60" | "40+120" | "60+180")
+    // "N+M": two positive integers separated by '+'. The UI offers
+    // 30+60 / 40+120 / 60+180, but any positive pair is valid.
+    let parts: Vec<&str> = p.split('+').collect();
+    parts.len() == 2
+        && parts.iter().all(|x| !x.is_empty() && x.parse::<u64>().ok().map(|v| v > 0).unwrap_or(false))
 }
 
 #[derive(Debug, Serialize)]

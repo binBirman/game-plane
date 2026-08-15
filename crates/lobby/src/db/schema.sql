@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS game_instances (
 CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_user    ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_room_players_uid ON room_players(uid);
-CREATE INDEX IF NOT EXISTS idx_room_players_online ON room_players(online);
 CREATE INDEX IF NOT EXISTS idx_instances_room  ON game_instances(room_id);
-CREATE INDEX IF NOT EXISTS idx_instances_action ON game_instances(last_action_at);
+-- NOTE: idx_room_players_online / idx_instances_action are created in
+-- migrations.rs AFTER the ALTER TABLE adds those columns (new-DB-first
+-- ordering problem otherwise).

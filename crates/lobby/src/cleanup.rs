@@ -94,13 +94,15 @@ async fn sweep_running_stuck(state: &AppState, action_secs: i64) -> anyhow::Resu
          JOIN game_instances gi ON gi.room_id = r.room_id
          WHERE r.status IN ('Running','Starting')
            AND gi.status IN ('starting','ready','running')
-           AND (
-             gi.last_action_at IS NULL
-             OR datetime(gi.last_action_at, ?) < datetime('now')
-           )
+           -- Baseline = first action if present, otherwise instance start time.
+           -- A freshly-started game with no action yet gets 300s from start
+           -- before it's considered abandoned.
+           AND datetime(
+                COALESCE(gi.last_action_at, gi.start_time),
+                ?
+           ) < datetime('now')
          LIMIT 20",
     )
-    // sqlite doesn't allow parameterizing the modifier string, so we inline.
     .bind(format!("+{action_secs} seconds"))
     .fetch_all(&state.db)
     .await?;
