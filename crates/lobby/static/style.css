@@ -898,6 +898,16 @@ button.confirm:hover { background: #ef4444; }
 .seat-name { font-weight: 600; font-size: 14px; line-height: 1.2; }
 .seat-score { font-size: 12px; color: var(--muted); }
 
+/* Player time pools: refresh (white) + reserve (orange). */
+.seat-time {
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    margin-top: 2px;
+}
+.seat-time .time-a   { color: #fff; font-weight: 600; }
+.seat-time .time-b   { color: #f97316; font-weight: 600; }
+.seat-time .time-plus { color: #f97316; }
+
 /* ── prediction status (2 columns: green prior / yellow posterior) ── */
 .seat-predictions {
     display: flex; gap: 8px;

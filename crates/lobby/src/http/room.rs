@@ -23,11 +23,12 @@ pub struct CreateReq {
 }
 
 fn validate_timer_preset(p: &str) -> bool {
-    // "N+M": two positive integers separated by '+'. The UI offers
-    // 30+60 / 40+120 / 60+180, but any positive pair is valid.
+    // "N+M": two non-negative integers separated by '+'. The UI offers
+    // 30+60 / 40+120 / 60+180 / 300+0, but any pair is valid (0 = unlimited
+    // for that step).
     let parts: Vec<&str> = p.split('+').collect();
     parts.len() == 2
-        && parts.iter().all(|x| !x.is_empty() && x.parse::<u64>().ok().map(|v| v > 0).unwrap_or(false))
+        && parts.iter().all(|x| !x.is_empty() && x.parse::<u64>().is_ok())
 }
 
 #[derive(Debug, Serialize)]

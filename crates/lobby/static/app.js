@@ -441,9 +441,10 @@
                     el("option", { value: "30+60" }, "快速（30+60）"),
                     el("option", { value: "40+120", selected: true }, "标准（40+120）"),
                     el("option", { value: "60+180" }, "宽松（60+180）"),
+                    el("option", { value: "300+0" }, "超长（300+0）"),
                 ]),
                 el("span", { class: "muted", style: "font-size:12px;margin-left:8px" },
-                    "快速/标准=每轮计时；宽松=整局共享"),
+                    "快速/标准=每轮计时；宽松=整局共享；超长=预测5分钟、出牌不限时"),
             ]),
         ]);
         app.appendChild(createCard);
@@ -1024,8 +1025,6 @@
         stage.appendChild(el("div", { class: "seat-b",      id: "seat-b" }));
         app.appendChild(stage);
         app.appendChild(el("div", { class: "card-actions", id: "card-actions" }, ""));
-        // Countdown bar for the current step timer.
-        app.appendChild(el("div", { class: "countdown", id: "countdown" }, ""));
         app.appendChild(el("div", { class: "hand", id: "card-hand" }, ""));
         app.appendChild(el("div", { class: "event-log", id: "game-log", style: "margin-top:16px" }, ""));
 
@@ -1041,6 +1040,7 @@
     function renderCardBoard(s) {
         if (!s) return;
         typSnapshot = s;
+        startTypCountdown(s);  // one-shot: live per-second re-render for countdowns
         const status = $("#game-status");
         const players = s.players || [];
         if (players.length === 0) return;
@@ -1122,8 +1122,6 @@
             }
         }
 
-        updateCountdown(s);
-
         if (s.is_over || s.phase === "ended") {
             showGameOverForCard(s);
         }
@@ -1142,36 +1140,58 @@
         });
     }
 
-    // Countdown bar: shows remaining step-timer seconds; updates every second
-    // between snapshots (snapshot gives the authoritative remaining_ms).
-    let countdownDeadline = null;
-    function updateCountdown(s) {
-        const el_ = $("#countdown");
-        if (!el_) return;
-        if (s.phase === "waiting_all" || s.phase === "ended" || s.is_over) {
-            el_.classList.add("hidden");
-            countdownDeadline = null;
-            return;
+    // Live countdown: track the last snapshot's wall-clock time so we can
+    // decay each player's A+B locally every second without waiting for the
+    // next snapshot (which only arrives on actions or timeouts).
+    let typCountdownTimer = null;
+    let typSnapshotAt = Date.now();
+    function startTypCountdown(s) {
+        typSnapshotAt = Date.now();
+        if (typCountdownTimer) return;
+        typCountdownTimer = setInterval(() => {
+            if (!typSnapshot) return;
+            if (typSnapshot.phase === "ended" || typSnapshot.phase === "waiting_all") {
+                clearInterval(typCountdownTimer);
+                typCountdownTimer = null;
+                return;
+            }
+            // Re-render seat panels (rebuild shows decayed time via buildTimeEl).
+            renderCardBoard(typSnapshot);
+        }, 1000);
+    }
+
+    // Time display: A (refresh, white) + B (reserve, orange). Zero pools are
+    // hidden and the '+' sign goes away. If both are present, '+' is orange.
+    // The displayed values decay by (now - snapshotAt) — A drains first, then B.
+    function buildTimeEl(s, uid) {
+        const t = (s.times || []).find(([u]) => u === uid);
+        if (!t) return null;
+        let [, aMs, bMs, _rem] = t;
+        // Decay by seconds elapsed since this snapshot (only while the game is
+        // in a timed phase and the player is expected to act).
+        const inPhase = s.phase === "prior_prediction" || s.phase === "play" || s.phase === "posterior_prediction";
+        if (inPhase) {
+            const decayMs = Math.max(0, Date.now() - typSnapshotAt);
+            const takeA = Math.min(aMs, decayMs);
+            aMs -= takeA;
+            bMs = bMs > (decayMs - takeA) ? bMs - (decayMs - takeA) : 0;
         }
-        const ms = s.deadline_remaining_ms || 0;
-        if (ms > 0) {
-            countdownDeadline = Date.now() + ms;
+        const aSecs = Math.ceil(aMs / 1000);
+        const bSecs = Math.ceil(bMs / 1000);
+        const wrap = el("div", { class: "seat-time" });
+        if (aSecs > 0) {
+            wrap.appendChild(el("span", { class: "time-a" }, `${aSecs}s`));
         }
-        if (!countdownDeadline) {
-            el_.classList.add("hidden");
-            return;
+        if (aSecs > 0 && bSecs > 0) {
+            wrap.appendChild(el("span", { class: "time-plus" }, " + "));
         }
-        el_.classList.remove("hidden");
-        const render = () => {
-            const left = Math.max(0, countdownDeadline - Date.now());
-            const secs = Math.ceil(left / 1000);
-            el_.textContent = `剩余 ${secs}s`;
-            el_.style.width = (left / 1000 / 60 * 100) + "%";
-        };
-        render();
-        if (!el_._tick) {
-            el_._tick = setInterval(render, 250);
+        if (bSecs > 0) {
+            wrap.appendChild(el("span", { class: "time-b" }, `${bSecs}s`));
         }
+        if (wrap.children.length === 0) {
+            wrap.appendChild(el("span", { class: "time-a" }, "0s"));
+        }
+        return wrap;
     }
 
     function buildSeatPanel(s, seatIdx, uid, isSelf) {
@@ -1195,6 +1215,11 @@
         info.appendChild(el("div", { class: "seat-score" }, `${data.score} 分`));
         header.appendChild(info);
         panel.appendChild(header);
+
+        // Player time: refresh pool (white) + reserve pool (orange).
+        // e.g. "30s + 60s"; hides a zero pool and its '+' sign.
+        const timeEl = buildTimeEl(s, uid);
+        if (timeEl) panel.appendChild(timeEl);
 
         const preds = el("div", { class: "seat-predictions" });
         const priorText = data.predictionCommitted

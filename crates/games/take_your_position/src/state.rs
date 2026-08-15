@@ -59,33 +59,37 @@ pub struct PlayerState {
     pub restart_yes: bool,
     /// Every card this player has played across all rounds.
     pub played_history: Vec<Card>,
+    // ── per-player time budget ───────────────────────────────
+    /// Remaining "refresh" pool (ms). Refills to `refresh_ms` after each action.
+    pub time_a_ms: u64,
+    /// Remaining "reserve" pool (ms). Never resets; drains after A is empty.
+    pub time_b_ms: u64,
+    /// When this player's current thinking interval began (None = not thinking).
+    pub thinking_since: Option<std::time::Instant>,
 }
 
-/// Step timer budget. `per_round` == true → reset each round; false → the
-/// budget is shared across the whole game (global countdown).
+/// Player time budget. `A` refills on every action; `B` is a one-time reserve
+/// for the whole game. A player's total available time = A + B.
 #[derive(Debug, Clone, Copy)]
 pub struct StepTimers {
-    pub per_round: bool,
-    pub predict_secs: u64,
-    pub play_secs: u64,
+    /// Refresh pool per action (ms).
+    pub refresh_ms: u64,
+    /// One-time reserve pool per player (ms), never resets.
+    pub reserve_ms: u64,
 }
 
 impl StepTimers {
-    /// Parse a timer preset like "30+60" | "40+120" | "60+180".
-    /// First number = prior-prediction budget, second = play budget.
-    /// Presets < 60s for play are treated as per-round; the 60+180 preset is
-    /// the global-shared one.
+    /// Parse "A+B" (ms from seconds). A = per-action refresh, B = whole-game reserve.
     pub fn from_preset(preset: Option<&str>) -> Self {
-        let (predict, play, per_round) = match preset.unwrap_or("30+60").split('+').collect::<Vec<_>>()[..] {
-            [p, pl] => {
-                let p: u64 = p.trim().parse().unwrap_or(30);
-                let pl: u64 = pl.trim().parse().unwrap_or(60);
-                // 60+180 => global shared; others => per-round reset.
-                (p, pl, !(p == 60 && pl == 180))
+        let (a, b) = match preset.unwrap_or("30+60").split('+').collect::<Vec<_>>()[..] {
+            [a, b] => {
+                let a: u64 = a.trim().parse().unwrap_or(30);
+                let b: u64 = b.trim().parse().unwrap_or(60);
+                (a, b)
             }
-            _ => (30, 60, true),
+            _ => (30, 60),
         };
-        Self { per_round, predict_secs: predict, play_secs: play }
+        Self { refresh_ms: a * 1000, reserve_ms: b * 1000 }
     }
 }
 
@@ -109,10 +113,8 @@ pub struct GameState {
     /// unbounded across rounds.
     pub pending_events: Vec<crate::event::Event>,
 
-    /// Step timers (None = no time limit).
+    /// Player time budget config (None = no time limit).
     pub timers: Option<StepTimers>,
-    /// Monotonic deadline for the current phase, if a timer is active.
-    pub deadline: Option<std::time::Instant>,
     /// uids that have successfully authenticated (login/reconnect) — used to
     /// delay the first round until everyone is in.
     pub joined: std::collections::HashSet<i64>,
@@ -137,7 +139,6 @@ impl GameState {
             table: vec![],
             pending_events: Vec::new(),
             timers: None,
-            deadline: None,
             joined,
             posterior_draft: Vec::new(),
         }
@@ -152,6 +153,81 @@ impl GameState {
 
     pub fn all_joined(&self) -> bool {
         self.joined.len() >= self.players.len()
+    }
+
+    /// Initialize each player's time pools from the timer config.
+    /// Called after `timers` is set.
+    pub fn apply_timer_config(&mut self) {
+        if let Some(t) = self.timers {
+            for p in &mut self.players {
+                p.time_a_ms = t.refresh_ms;
+                p.time_b_ms = t.reserve_ms;
+            }
+        }
+    }
+
+    /// Start counting thinking time for players who still need to act.
+    /// Players already thinking keep their interval.
+    pub fn start_thinking(&mut self) {
+        let now = std::time::Instant::now();
+        for (seat, p) in self.players.iter_mut().enumerate() {
+            let needs_act = match self.phase {
+                Phase::WaitingAll | Phase::End => false,
+                Phase::PriorPrediction => !p.has_predicted,
+                Phase::Play => p.committed_card.is_none(),
+                Phase::PosteriorPrediction => seat == self.start_player && p.posterior_prediction.is_none(),
+            };
+            if needs_act && p.thinking_since.is_none() {
+                p.thinking_since = Some(now);
+            }
+            if !needs_act {
+                p.thinking_since = None;
+            }
+        }
+    }
+
+    /// Elapsed ms while thinking for a player (0 if not thinking).
+    pub fn thinking_elapsed_ms(&self, seat: usize) -> u64 {
+        match self.players[seat].thinking_since {
+            Some(t0) => t0.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            None => 0,
+        }
+    }
+
+    /// Remaining total time (ms) for a player: A + B, accounting for the
+    /// in-progress thinking interval.
+    pub fn remaining_ms(&self, seat: usize) -> u64 {
+        let a = self.players[seat].time_a_ms;
+        let b = self.players[seat].time_b_ms;
+        let elapsed = self.thinking_elapsed_ms(seat);
+        let total = a.saturating_add(b).saturating_sub(elapsed);
+        total
+    }
+
+    /// Settle the thinking interval for a player after an action:
+    /// deduct elapsed from A first, then from B, then refill A.
+    pub fn settle_action(&mut self, seat: usize) {
+        let elapsed = self.thinking_elapsed_ms(seat);
+        if elapsed > 0 {
+            let a = &mut self.players[seat].time_a_ms;
+            let take_from_a = (*a).min(elapsed);
+            *a -= take_from_a;
+            let rest = elapsed - take_from_a;
+            if rest > 0 {
+                let b = &mut self.players[seat].time_b_ms;
+                *b = b.saturating_sub(rest);
+            }
+        }
+        self.players[seat].thinking_since = None;
+        // Refill A after the action.
+        if let Some(t) = self.timers {
+            self.players[seat].time_a_ms = t.refresh_ms;
+        }
+    }
+
+    /// True if a player has run out of time (A + B both consumed → will proxy).
+    pub fn out_of_time(&self, seat: usize) -> bool {
+        self.timers.is_some() && self.remaining_ms(seat) == 0
     }
 
     /// Hand out 5 cards per player: 2 small (A-7 ♥/♣/♦) + 2 big (8-K ♥/♣/♦) + 1 spade (A-K ♠).
@@ -260,57 +336,7 @@ impl GameState {
         self.table.clear();
         self.pending_events.clear();
         self.phase = Phase::PriorPrediction;
-        self.refresh_deadline();
-    }
-
-    /// Set / keep the deadline for the current phase based on `timers`.
-    /// Per-round mode resets the deadline on every phase entry; global mode
-    /// keeps the first-set deadline across rounds.
-    pub fn refresh_deadline(&mut self) {
-        let Some(t) = self.timers else {
-            self.deadline = None;
-            return;
-        };
-        if t.per_round {
-            // Fresh budget each time we enter a phase.
-            self.deadline = self.phase_deadline();
-        } else {
-            // Global shared: keep whatever deadline was first set for this phase.
-            if self.deadline.is_none() {
-                self.deadline = self.phase_deadline();
-            }
-        }
-    }
-
-    fn phase_deadline(&self) -> Option<std::time::Instant> {
-        let t = self.timers?;
-        let secs = match self.phase {
-            Phase::WaitingAll => return None,
-            Phase::PriorPrediction => t.predict_secs,
-            Phase::Play => t.play_secs,
-            Phase::PosteriorPrediction => t.play_secs, // reuse play budget for posterior
-            Phase::End => return None,
-        };
-        Some(std::time::Instant::now() + std::time::Duration::from_secs(secs))
-    }
-
-    /// True if the current phase's deadline has passed.
-    pub fn deadline_passed(&self) -> bool {
-        match self.deadline {
-            Some(d) => std::time::Instant::now() >= d,
-            None => false,
-        }
-    }
-
-    /// Milliseconds remaining until the phase deadline, or 0 if none / passed.
-    pub fn deadline_remaining_ms(&self) -> u64 {
-        match self.deadline {
-            Some(d) => d
-                .saturating_duration_since(std::time::Instant::now())
-                .as_millis()
-                .min(u128::from(u64::MAX)) as u64,
-            None => 0,
-        }
+        self.start_thinking();
     }
 
     /// Move every player's `committed_card` into `table` (revealed) and append

@@ -284,6 +284,9 @@ pub fn build_players(uid_in_order: &[i64]) -> Vec<PlayerState> {
             posterior_prediction: None,
             restart_yes: false,
             played_history: vec![],
+            time_a_ms: 0,
+            time_b_ms: 0,
+            thinking_since: None,
         })
         .collect()
 }
