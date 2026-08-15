@@ -16,6 +16,8 @@ use crate::event::Event;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
+    /// Waiting for all players to connect (no timer running yet).
+    WaitingAll,
     PriorPrediction,
     Play,
     PosteriorPrediction,
@@ -25,6 +27,7 @@ pub enum Phase {
 impl Phase {
     pub fn name(&self) -> &'static str {
         match self {
+            Phase::WaitingAll => "waiting_all",
             Phase::PriorPrediction => "prior_prediction",
             Phase::Play => "play",
             Phase::PosteriorPrediction => "posterior_prediction",
@@ -110,22 +113,45 @@ pub struct GameState {
     pub timers: Option<StepTimers>,
     /// Monotonic deadline for the current phase, if a timer is active.
     pub deadline: Option<std::time::Instant>,
+    /// uids that have successfully authenticated (login/reconnect) — used to
+    /// delay the first round until everyone is in.
+    pub joined: std::collections::HashSet<i64>,
+    /// In-progress posterior prediction draft (best→worst uids). First player
+    /// edits this live via `draft_posterior`; the frontend sees it in
+    /// snapshots so everyone watches the selection in real time. Only the
+    /// committed posterior (via `posterior_predict`) counts for scoring.
+    pub posterior_draft: Vec<i64>,
 }
 
 impl GameState {
     pub fn new(players: Vec<PlayerState>) -> Self {
         let start_player = players.first().map(|p| p.id).unwrap_or(0);
+        // joined starts empty — WaitingAll until every player authenticates.
+        let joined = std::collections::HashSet::new();
         Self {
             players,
             round: 0,
             start_player,
-            phase: Phase::PriorPrediction,
+            phase: Phase::WaitingAll,  // wait for everyone to connect
             current_player: Some(start_player),
             table: vec![],
             pending_events: Vec::new(),
             timers: None,
             deadline: None,
+            joined,
+            posterior_draft: Vec::new(),
         }
+    }
+
+    /// Mark a player as authenticated. Returns true when the last player just
+    /// joined (transition to PriorPrediction + start timer).
+    pub fn mark_joined(&mut self, uid: i64) -> bool {
+        self.joined.insert(uid);
+        self.joined.len() == self.players.len()
+    }
+
+    pub fn all_joined(&self) -> bool {
+        self.joined.len() >= self.players.len()
     }
 
     /// Hand out 5 cards per player: 2 small (A-7 ♥/♣/♦) + 2 big (8-K ♥/♣/♦) + 1 spade (A-K ♠).
@@ -168,7 +194,9 @@ impl GameState {
         self.round = 0;
         self.start_player = self.players.first().map(|p| p.id).unwrap_or(0);
         self.current_player = Some(self.start_player);
-        self.phase = Phase::PriorPrediction;
+        // deal() is called both at initial construction (game should wait for
+        // everyone to join) and on restart (everyone is already present). So
+        // keep the current phase; callers decide WaitingAll vs PriorPrediction.
     }
 
     /// Seat index of the next player who hasn't acted yet in the current phase.
@@ -203,7 +231,7 @@ impl GameState {
                     None
                 }
             }
-            Phase::End => None,
+            Phase::End | Phase::WaitingAll => None,
         }
     }
 
@@ -228,6 +256,7 @@ impl GameState {
             p.committed_card = None;
             p.posterior_prediction = None;
         }
+        self.posterior_draft.clear();
         self.table.clear();
         self.pending_events.clear();
         self.phase = Phase::PriorPrediction;
@@ -256,6 +285,7 @@ impl GameState {
     fn phase_deadline(&self) -> Option<std::time::Instant> {
         let t = self.timers?;
         let secs = match self.phase {
+            Phase::WaitingAll => return None,
             Phase::PriorPrediction => t.predict_secs,
             Phase::Play => t.play_secs,
             Phase::PosteriorPrediction => t.play_secs, // reuse play budget for posterior
@@ -269,6 +299,17 @@ impl GameState {
         match self.deadline {
             Some(d) => std::time::Instant::now() >= d,
             None => false,
+        }
+    }
+
+    /// Milliseconds remaining until the phase deadline, or 0 if none / passed.
+    pub fn deadline_remaining_ms(&self) -> u64 {
+        match self.deadline {
+            Some(d) => d
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+            None => 0,
         }
     }
 

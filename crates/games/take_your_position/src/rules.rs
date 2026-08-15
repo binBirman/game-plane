@@ -117,6 +117,41 @@ impl GameState {
         Ok(vec![Event::PosteriorPredictionAccepted { uid }])
     }
 
+    /// Live-editable posterior draft (best→worst uids). Unlike
+    /// `apply_posterior`, this does NOT commit or lock — it only updates the
+    /// shared draft so everyone sees the first player's in-progress selection.
+    /// The first player can keep editing; nothing counts until `apply_posterior`.
+    pub fn apply_posterior_draft(&mut self, uid: i64, rank_list: Vec<i64>) -> Result<Vec<Event>, RuleError> {
+        if self.phase != Phase::PosteriorPrediction {
+            return Err(RuleError::WrongPhase { expected: "posterior_prediction", got: self.phase.name() });
+        }
+        let seat = self.seat_of(uid).ok_or(RuleError::Unknown)?;
+        if seat != self.start_player {
+            return Err(RuleError::NotFirstPlayer);
+        }
+        // If already committed, ignore further edits.
+        if self.players[seat].posterior_prediction.is_some() {
+            return Err(RuleError::AlreadyActed);
+        }
+        let n = self.players.len();
+        if !rank_list.is_empty() {
+            if rank_list.len() != n {
+                return Err(RuleError::OutOfRange);
+            }
+            let mut seen = vec![false; n];
+            for &u in &rank_list {
+                let s = self.seat_of(u).ok_or(RuleError::OutOfRange)?;
+                if seen[s] { return Err(RuleError::OutOfRange); }
+                seen[s] = true;
+            }
+            if seen.iter().any(|&x| !x) {
+                return Err(RuleError::OutOfRange);
+            }
+        }
+        self.posterior_draft = rank_list;
+        Ok(vec![])
+    }
+
     /// Compute scores for the just-revealed table and return the RoundResult
     /// event. Caller must have already called `reveal_plays()`.
     pub fn finish_round(&mut self) -> Event {

@@ -108,6 +108,14 @@ pub trait GameLogic: Send + Sync + 'static {
     fn tick(&mut self) {
         // default no-op
     }
+
+    /// Called whenever a player successfully authenticates (login or
+    /// reconnect). Games that want to delay starting until all players are
+    /// present implement this (e.g. track who has joined and only kick off
+    /// the first round once everyone is in). Default: no-op.
+    fn on_player_login(&mut self, _uid: i64) {
+        // default no-op
+    }
 }
 
 /// 启动游戏：读 stdin init → 解析 config → bind WS → 发 ready → 跑事件循环。
@@ -291,6 +299,7 @@ async fn handle_socket<L: GameLogic>(
                     if from_logic || from_registry {
                         uid = u;
                         authed = true;
+                        logic.lock().await.on_player_login(u);
                     } else {
                         let _ = send_err(
                             &mut sender,
@@ -307,6 +316,7 @@ async fn handle_socket<L: GameLogic>(
                     if from_logic || from_registry {
                         uid = u;
                         authed = true;
+                        logic.lock().await.on_player_login(u);
                     } else {
                         let _ = send_err(
                             &mut sender,

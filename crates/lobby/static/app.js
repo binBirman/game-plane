@@ -452,6 +452,7 @@
             const v = $("#game-type").value;
             $("#timer-row").classList.toggle("hidden", v !== "take_your_position");
         }
+        onGameTypeChange();  // reflect initial value (TYP → show timer row)
 
         app.appendChild(el("h2", { style: "margin:24px 0 8px;font-size:15px;color:var(--muted)" }, "现有房间"));
         const list = el("div", { class: "room-list", id: "room-list" }, [renderRoomListSkeleton()]);
@@ -579,6 +580,14 @@
                 Destroyed: "房间已销毁",
             };
             toast(labels[next.status] || ("状态 → " + next.status), next.status === "Running" ? "ok" : "");
+            // Auto-enter the game once it starts running (all players join).
+            if (next.status === "Running" && next.current_instance_id) {
+                const inRoom = next.players.some(p => p.uid === state.uid);
+                if (inRoom) {
+                    stopRoomPolling();
+                    location.hash = "#game/" + next.current_instance_id;
+                }
+            }
         }
     }
 
@@ -1015,6 +1024,8 @@
         stage.appendChild(el("div", { class: "seat-b",      id: "seat-b" }));
         app.appendChild(stage);
         app.appendChild(el("div", { class: "card-actions", id: "card-actions" }, ""));
+        // Countdown bar for the current step timer.
+        app.appendChild(el("div", { class: "countdown", id: "countdown" }, ""));
         app.appendChild(el("div", { class: "hand", id: "card-hand" }, ""));
         app.appendChild(el("div", { class: "event-log", id: "game-log", style: "margin-top:16px" }, ""));
 
@@ -1058,18 +1069,23 @@
             if (s.start_player !== myUid) pendingPosteriorRanks = {};
         } else if (s.phase === "play") {
             pendingPosteriorRanks = {};
+            cardSelectedIndex = -1;  // fresh selection each play step
         } else if (s.phase === "ended" || s.is_over) {
             pendingPosteriorRanks = {};
             pendingPredictRank = undefined;
+            cardSelectedIndex = -1;
         }
 
-        const positions = ["seat-b", "seat-r", "seat-tr", "seat-tl", "seat-l"];
+        // Seat placement around the table. Self is always at the bottom.
+        // Going counter-clockwise (the prediction order) from self: bottom → left
+        // → top-left → top-right → right. So seat index decreases counter-clockwise.
+        const positions = ["seat-b", "seat-l", "seat-tl", "seat-tr", "seat-r"];
         for (const id of positions) {
             const el_ = $("#" + id);
             if (el_) el_.innerHTML = "";
         }
         for (let phys = 0; phys < 5; phys++) {
-            const seatIdx = (mySeatIdx + phys) % 5;
+            const seatIdx = (mySeatIdx - phys + 5) % 5;
             const uid = players[seatIdx];
             const container = $("#" + positions[phys]);
             if (!container) continue;
@@ -1081,7 +1097,12 @@
         renderActionPanel(s);
 
         if (status) {
-            if (s.is_over || s.phase === "ended") {
+            if (s.phase === "waiting_all") {
+                const joined = (s.online || []).length;
+                const total = (s.players || []).length;
+                status.textContent = `等待全部玩家连接（${joined}/${total}）`;
+                status.className = "subtitle status-bar connected";
+            } else if (s.is_over || s.phase === "ended") {
                 status.textContent = "游戏结束";
                 status.className = "subtitle status-bar";
             } else if (s.phase === "prior_prediction") {
@@ -1101,6 +1122,8 @@
             }
         }
 
+        updateCountdown(s);
+
         if (s.is_over || s.phase === "ended") {
             showGameOverForCard(s);
         }
@@ -1117,6 +1140,38 @@
                 }
             }
         });
+    }
+
+    // Countdown bar: shows remaining step-timer seconds; updates every second
+    // between snapshots (snapshot gives the authoritative remaining_ms).
+    let countdownDeadline = null;
+    function updateCountdown(s) {
+        const el_ = $("#countdown");
+        if (!el_) return;
+        if (s.phase === "waiting_all" || s.phase === "ended" || s.is_over) {
+            el_.classList.add("hidden");
+            countdownDeadline = null;
+            return;
+        }
+        const ms = s.deadline_remaining_ms || 0;
+        if (ms > 0) {
+            countdownDeadline = Date.now() + ms;
+        }
+        if (!countdownDeadline) {
+            el_.classList.add("hidden");
+            return;
+        }
+        el_.classList.remove("hidden");
+        const render = () => {
+            const left = Math.max(0, countdownDeadline - Date.now());
+            const secs = Math.ceil(left / 1000);
+            el_.textContent = `剩余 ${secs}s`;
+            el_.style.width = (left / 1000 / 60 * 100) + "%";
+        };
+        render();
+        if (!el_._tick) {
+            el_._tick = setInterval(render, 250);
+        }
     }
 
     function buildSeatPanel(s, seatIdx, uid, isSelf) {
@@ -1174,6 +1229,20 @@
             panel.appendChild(buildPosteriorRankRow(s, uid));
         }
 
+        // The card this player played this round — displayed next to their
+        // own role card. Owner sees face-up; others see face-down.
+        if (s.phase === "play" && data.committed !== null && data.committed !== undefined) {
+            const slot = el("div", { class: "committed-slot" });
+            if (data.committed.hidden === false) {
+                slot.appendChild(window.cardRender.renderCardEl({
+                    s: data.committed.s, r: data.committed.r,
+                }));
+            } else {
+                slot.appendChild(window.cardRender.renderCardEl(null, { faceDown: true }));
+            }
+            panel.appendChild(slot);
+        }
+
         if (data.history && data.history.length > 0) {
             const hist = el("div", { class: "seat-history" });
             hist.appendChild(el("span", { class: "label" }, "已出:"));
@@ -1204,35 +1273,41 @@
     function buildPosteriorRankRow(s, forUid) {
         const isEditor = s.start_player === myUid;
         const row = el("div", { class: "posterior-row" });
-        const assignedRank = pendingPosteriorRanks[forUid];
+        // The shared draft is `s.posterior_draft` (uids best→worst), synced in
+        // real time via draft_posterior. Rank of this player = index+1 in it.
+        const draft = Array.isArray(s.posterior_draft) ? s.posterior_draft : [];
+        const assignedRank = draft.indexOf(forUid) + 1;
         for (let r = 1; r <= 5; r++) {
             const btn = el("button", { class: "rank-mini" }, String(r));
             if (assignedRank === r) btn.classList.add("assigned");
             if (!isEditor) {
-                // Read-only display for non-first players.
                 btn.disabled = true;
                 btn.title = "";
                 row.appendChild(btn);
                 continue;
             }
-            // Editor: disable ranks already taken by another player.
-            const usedByOther = Object.entries(pendingPosteriorRanks)
-                .some(([u, v]) => Number(u) !== forUid && v === r);
+            // Editor: disable ranks already taken by another player in the draft.
+            const usedByOther = draft.some((u, idx) => u !== forUid && idx + 1 === r);
             if (usedByOther) btn.disabled = true;
             btn.addEventListener("click", () => {
-                if (assignedRank === r) {
-                    delete pendingPosteriorRanks[forUid];
-                } else {
-                    Object.keys(pendingPosteriorRanks).forEach(u => {
-                        if (pendingPosteriorRanks[u] === r) delete pendingPosteriorRanks[u];
-                    });
-                    pendingPosteriorRanks[forUid] = r;
+                // Build a new draft: remove this player, then insert at rank r.
+                let next = draft.filter(u => u !== forUid);
+                if (assignedRank !== r) {
+                    next.splice(r - 1, 0, forUid);
                 }
+                pendingPosteriorRanks = draftToMap(next);
+                sendCardAction({ action: "draft_posterior", rank_list: next });
                 renderCardBoard(typSnapshot);
             });
             row.appendChild(btn);
         }
         return row;
+    }
+
+    function draftToMap(draft) {
+        const m = {};
+        draft.forEach((uid, idx) => { m[uid] = idx + 1; });
+        return m;
     }
 
     function renderCenterArea(s) {
@@ -1302,9 +1377,16 @@
         if (!s.hand) return;
         const canPlay = s.phase === "play" && !s.is_over;
         s.hand.forEach((c, idx) => {
+            // Clicking selects the card (no immediate send); a confirm button in
+            // the action panel then submits play_card. Selected card is raised.
             const card = window.cardRender.renderCardEl({ s: c.s, r: c.r }, {
                 clickable: canPlay,
-                onClick: () => sendCardAction({ action: "play_card", card_index: idx }),
+                selected: cardSelectedIndex === idx,
+                onClick: () => {
+                    if (cardSelectedIndex === idx) cardSelectedIndex = -1;
+                    else cardSelectedIndex = idx;
+                    renderCardBoard(typSnapshot);
+                },
             });
             handEl.appendChild(card);
         });
@@ -1330,8 +1412,23 @@
         }
         if (s.phase === "play") {
             const committed = (s.committed || []).filter(([_, c]) => c !== null).length;
-            actionsEl.appendChild(el("div", { class: "subtitle" },
-                `同时出牌阶段 — ${committed}/5 已提交，点击下方手牌即可出牌`));
+            const group = el("div", { class: "group" }, [
+                el("span", { class: "subtitle" },
+                    `出牌阶段 — ${committed}/5 已提交`),
+            ]);
+            if (committed < (s.players || []).length) {
+                // Confirm button: enabled once a hand card is selected.
+                const sel = cardSelectedIndex >= 0 ? cardSelectedIndex : null;
+                const confirm = el("button", { class: "primary confirm", disabled: sel === null },
+                    sel === null ? "先点选一张手牌" : `确认出第 ${sel + 1} 张`);
+                confirm.addEventListener("click", () => {
+                    if (cardSelectedIndex < 0) return;
+                    sendCardAction({ action: "play_card", card_index: cardSelectedIndex });
+                    cardSelectedIndex = -1;
+                });
+                group.appendChild(confirm);
+            }
+            actionsEl.appendChild(group);
             return;
         }
         if (s.phase === "posterior_prediction") {
@@ -1398,20 +1495,18 @@
             return group;
         }
 
-        const values = Object.values(pendingPosteriorRanks);
-        const allUnique = values.length === 5 && new Set(values).size === 5;
+        // Confirm uses the live-shared draft (s.posterior_draft) as the order.
+        const draft = Array.isArray(s.posterior_draft) ? s.posterior_draft : [];
+        const allPresent = (s.players || []).every(uid => draft.includes(uid));
+        const allUnique = allPresent && draft.length === (s.players || []).length
+            && new Set(draft).size === draft.length;
 
         const confirm = el("button", { class: "primary confirm" }, "确认");
         confirm.disabled = !allUnique;
         confirm.title = allUnique ? "" : "需要给所有 5 名玩家各分配一个不重复的名次";
         confirm.addEventListener("click", () => {
             if (!allUnique) return;
-            const rankList = [];
-            for (let r = 1; r <= 5; r++) {
-                const entry = Object.entries(pendingPosteriorRanks).find(([_, v]) => v === r);
-                if (entry) rankList.push(Number(entry[0]));
-            }
-            sendCardAction({ action: "posterior_predict", rank_list: rankList });
+            sendCardAction({ action: "posterior_predict", rank_list: draft });
         });
         group.appendChild(confirm);
 

@@ -65,6 +65,7 @@ impl GameLogic for TakeYourPosition {
 
     fn phase(&self) -> PhaseInfo {
         let (name, active, awaiting) = match self.state.phase {
+            Phase::WaitingAll => ("waiting_all", None, Vec::new()),
             Phase::PriorPrediction => {
                 let cur = self.state.current_player.unwrap_or(self.state.start_player);
                 let active = self.state.uid_of_seat(cur);
@@ -139,7 +140,7 @@ impl GameLogic for TakeYourPosition {
         //  - Play: empty (cards are in `committed`, face-down)
         //  - PosteriorPrediction / End: revealed (face-up to all, owner sees {s,r,hidden:false})
         let table: Vec<(i64, Option<Value>)> = match self.state.phase {
-            Phase::Play | Phase::PriorPrediction => vec![],
+            Phase::Play | Phase::PriorPrediction | Phase::WaitingAll => vec![],
             Phase::PosteriorPrediction | Phase::End => self
                 .state
                 .table
@@ -187,8 +188,10 @@ impl GameLogic for TakeYourPosition {
             "predictions": predictions,
             "committed": committed,
             "posterior": posterior,
+            "posterior_draft": self.state.posterior_draft.clone(),
             "table": table,
             "hand": hand,
+            "deadline_remaining_ms": self.state.deadline_remaining_ms(),
             "history": history,
             "pending_events": self.pending_events_for_snapshot(),
             "is_over": self.is_over(),
@@ -214,6 +217,14 @@ impl GameLogic for TakeYourPosition {
                     .map(|a| a.iter().filter_map(|x| x.as_i64()).collect())
                     .unwrap_or_default(),
             ),
+            "draft_posterior" => self.state.apply_posterior_draft(
+                uid,
+                action
+                    .get("rank_list")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_i64()).collect())
+                    .unwrap_or_default(),
+            ),
             "restart_vote" => {
                 if let Some(seat) = self.state.seat_of(uid) {
                     self.state.players[seat].restart_yes = action
@@ -223,9 +234,11 @@ impl GameLogic for TakeYourPosition {
                     let yes_count = self.state.players.iter().filter(|p| p.restart_yes).count();
                     if yes_count == self.state.players.len() && self.is_over() {
                         self.state.deal();
+                        self.state.phase = Phase::PriorPrediction;
+                        self.state.current_player = Some(self.state.start_player);
                         self.state.refresh_deadline();
                         self.pending_events.push(Event::PhaseChanged {
-                            phase: self.state.phase.name().into(),
+                            phase: Phase::PriorPrediction.name().into(),
                         });
                         return ActionOutcome::Ok;
                     }
@@ -310,13 +323,27 @@ impl GameLogic for TakeYourPosition {
                     }
                 }
             }
-            Phase::End => {}
+            Phase::End | Phase::WaitingAll => {}
         }
 
         if acted {
             let mut events = Vec::new();
             self.advance_phase(&mut events);
             self.pending_events.extend(events);
+        }
+    }
+
+    fn on_player_login(&mut self, uid: i64) {
+        // First-round start is gated on everyone connecting. When the last
+        // player authenticates, transition WaitingAll → PriorPrediction and
+        // start the timer. Subsequent logins (reconnect) are no-ops.
+        if self.state.phase == Phase::WaitingAll && self.state.mark_joined(uid) {
+            self.state.phase = Phase::PriorPrediction;
+            self.state.current_player = Some(self.state.start_player);
+            self.state.refresh_deadline();
+            self.pending_events.push(Event::PhaseChanged {
+                phase: Phase::PriorPrediction.name().into(),
+            });
         }
     }
 }
@@ -351,7 +378,7 @@ impl TakeYourPosition {
                     out.push(self.state.players[sp].uid);
                 }
             }
-            Phase::End => {}
+            Phase::End | Phase::WaitingAll => {}
         }
         out
     }
@@ -399,6 +426,10 @@ impl TakeYourPosition {
                     self.state.begin_next_round();
                     events.push(Event::PhaseChanged { phase: Phase::PriorPrediction.name().into() });
                 }
+            }
+            Phase::WaitingAll => {
+                // Nothing to do here; the transition to PriorPrediction happens
+                // in `on_player_login` once everyone is in.
             }
             Phase::End => {}
         }
