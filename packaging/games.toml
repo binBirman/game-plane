@@ -13,3 +13,13 @@ min_players = 2
 max_players = 2
 enabled = true
 variants = []
+
+[[games]]
+type = "take_your_position"
+name = "TYP · Take Your Position"
+description = "5人预测出牌，每轮预测名次并出牌"
+binary = "/usr/local/bin/take_your_position"
+min_players = 5
+max_players = 5
+enabled = true
+variants = []
