@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Card Render Preview</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <header>
+        <div class="brand">Card Render Preview</div>
+        <nav>
+            <a href="/">返回大厅</a>
+        </nav>
+    </header>
+    <main>
+        <h1>零资源纸牌渲染 / 预览</h1>
+        <p class="subtitle">
+            所有样式用 CSS + Unicode ♠♥♦♣，零外部资源。
+            数据格式：<code>{s: 0..3, r: 0..12}</code>（suit, rank）。
+        </p>
+
+        <section class="preview-section">
+            <h2>1. 全部 52 张（按花色分行）</h2>
+            <div class="preview-stage">
+                <div id="grid-all"></div>
+            </div>
+        </section>
+
+        <section class="preview-section">
+            <h2>2. 内联模式（用于日志 / 玩家标签）</h2>
+            <div class="preview-stage">
+                <div id="inline-sample" style="font-size: 16px; line-height: 1.8;"></div>
+            </div>
+        </section>
+
+        <section class="preview-section">
+            <h2>3. 自己手牌（扇形布局，点击切换 selected）</h2>
+            <div class="preview-stage">
+                <div id="my-hand"></div>
+                <div style="text-align:center;margin-top:8px;">
+                    <button id="btn-reshuffle" class="primary">换一手牌</button>
+                </div>
+            </div>
+        </section>
+
+        <section class="preview-section">
+            <h2>4. 对手手牌（5 人桌，自己是 seat 0）</h2>
+            <div class="preview-stage">
+                <div id="opponents-row"></div>
+            </div>
+        </section>
+
+        <section class="preview-section">
+            <h2>5. 中央桌面（5 槽，已出牌）</h2>
+            <div class="preview-stage" style="display:flex;justify-content:center;">
+                <div id="table-area"></div>
+            </div>
+        </section>
+
+        <section class="preview-section">
+            <h2>6. 完整组合：对手 + 桌面 + 自己手牌</h2>
+            <div class="preview-stage">
+                <div id="combined-stage"></div>
+            </div>
+        </section>
+
+        <p class="subtitle" style="margin-top:24px;">
+            本页面由 <code>card-render.js</code> + <code>style.css</code>（追加的 .card*）构成，
+            无图片 / 字体 / 第三方脚本。后续接入 <code>take_your_position</code> 时，
+            <code>app.js</code> 的 <code>renderGame()</code> 会按 <code>game_type</code> 路由到这里。
+        </p>
+    </main>
+
+    <script src="/card-render.js"></script>
+    <script>
+    (function () {
+        "use strict";
+        var C = window.cardRender;
+
+        // ─── 1. full 52-card grid ──────────────────────────────────
+        (function renderGrid() {
+            var host = document.getElementById("grid-all");
+            for (var s = 0; s < 4; s++) {
+                var row = document.createElement("div");
+                row.className = "preview-suit-row";
+                for (var r = 0; r < 13; r++) {
+                    row.appendChild(C.renderCardEl({ s: s, r: r }));
+                }
+                host.appendChild(row);
+            }
+        })();
+
+        // ─── 2. inline mode ────────────────────────────────────────
+        (function renderInline() {
+            var host = document.getElementById("inline-sample");
+            var samples = [
+                { s: 1, r: 0 },   // A♥
+                { s: 0, r: 12 },  // K♠
+                { s: 2, r: 9 },   // 10♦
+                { s: 3, r: 6 },   // 7♣
+                null,             // face-down
+            ];
+            samples.forEach(function (c, i) {
+                if (i > 0) host.appendChild(document.createTextNode("  ·  "));
+                host.appendChild(C.renderCardInlineEl(c));
+            });
+            // Also append a "log line" style example
+            host.appendChild(document.createElement("br"));
+            var log = document.createElement("span");
+            log.className = "subtitle";
+            log.textContent = "例：玩家 alice 出了 ";
+            host.appendChild(log);
+            host.appendChild(C.renderCardInlineEl({ s: 1, r: 4 }));   // 5♥
+        })();
+
+        // ─── 3. own hand (fan + click-to-select) ───────────────────
+        var handCards = [];
+        function shuffleHand() {
+            handCards = [];
+            var pool = [];
+            for (var s = 0; s < 4; s++) for (var r = 0; r < 13; r++) pool.push({ s: s, r: r });
+            // Fisher-Yates
+            for (var i = pool.length - 1; i > 0; i--) {
+                var j = Math.floor(Math.random() * (i + 1));
+                var t = pool[i]; pool[i] = pool[j]; pool[j] = t;
+            }
+            handCards = pool.slice(0, 5);
+        }
+        var selectedSet = new Set();
+        function renderMyHand() {
+            var host = document.getElementById("my-hand");
+            host.innerHTML = "";
+            host.appendChild(C.renderHandEl(handCards, {
+                selectedSet: selectedSet,
+                clickable: true,
+                onCardClick: function (_card, idx) {
+                    if (selectedSet.has(idx)) selectedSet.delete(idx);
+                    else selectedSet.add(idx);
+                    renderMyHand();
+                },
+                ariaLabel: "your hand",
+            }));
+        }
+        shuffleHand();
+        renderMyHand();
+        document.getElementById("btn-reshuffle").addEventListener("click", function () {
+            shuffleHand();
+            selectedSet.clear();
+            renderMyHand();
+        });
+
+        // ─── 4. opponents row (5 seats, you are seat 0) ────────────
+        (function renderOpponents() {
+            var me = { uid: 0, name: "你", score: 12, prediction: 2, hasPredicted: true, isActive: false, isMe: true };
+            var opps = [
+                me,
+                { uid: 1, name: "Alice",  score: 9,  prediction: null, hasPredicted: false, isActive: true,  cardsCount: 5 },
+                { uid: 2, name: "Bob",    score: 7,  prediction: 4,    hasPredicted: true,  isActive: false, cardsCount: 5 },
+                { uid: 3, name: "Carol",  score: 5,  prediction: null, hasPredicted: false, isActive: false, cardsCount: 5 },
+                { uid: 4, name: "Dave",   score: 3,  prediction: 5,    hasPredicted: true,  isActive: false, cardsCount: 5 },
+            ];
+            document.getElementById("opponents-row").appendChild(
+                C.renderOpponentsEl(opps, { faceUp: false })
+            );
+        })();
+
+        // ─── 5. table (5 slots, some played) ───────────────────────
+        (function renderTable() {
+            var slots = [
+                { uid: 0, name: "你 (P0)",    card: { s: 1, r: 4 } },  // 5♥
+                { uid: 1, name: "Alice (P1)", card: { s: 0, r: 8 } },  // 9♠
+                { uid: 2, name: "Bob (P2)",   card: null },             // not played yet
+                { uid: 3, name: "Carol (P3)", card: { s: 2, r: 12 } }, // K♦
+                { uid: 4, name: "Dave (P4)",  card: { s: 3, r: 2 } },  // 3♣
+            ];
+            document.getElementById("table-area").appendChild(C.renderTableEl(slots));
+        })();
+
+        // ─── 6. combined stage ─────────────────────────────────────
+        (function renderCombined() {
+            var stage = document.getElementById("combined-stage");
+
+            var opps = [
+                { uid: 1, name: "Alice",  score: 9,  isActive: true,  cardsCount: 5 },
+                { uid: 2, name: "Bob",    score: 7,  isActive: false, cardsCount: 5 },
+                { uid: 3, name: "Carol",  score: 5,  isActive: false, cardsCount: 5 },
+                { uid: 4, name: "Dave",   score: 3,  isActive: false, cardsCount: 5 },
+            ];
+            stage.appendChild(C.renderOpponentsEl(opps, { faceUp: false }));
+
+            stage.appendChild(C.renderTableEl([
+                { uid: 0, name: "你",    card: { s: 1, r: 4 } },
+                { uid: 1, name: "Alice", card: { s: 0, r: 8 } },
+                { uid: 2, name: "Bob",   card: null },
+                { uid: 3, name: "Carol", card: { s: 2, r: 12 } },
+                { uid: 4, name: "Dave",  card: { s: 3, r: 2 } },
+            ]));
+
+            stage.appendChild(C.renderHandEl(handCards, {
+                ariaLabel: "your hand",
+            }));
+        })();
+    })();
+    </script>
+</body>
+</html>

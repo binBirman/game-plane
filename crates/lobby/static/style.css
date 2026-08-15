@@ -217,7 +217,11 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
     color: var(--muted);
     max-height: 180px;
     overflow-y: auto;
+}
+.event-log .log-entry {
+    padding: 1px 0;
     white-space: pre-wrap;
+    word-break: break-all;
 }
 
 .toast {
@@ -610,3 +614,495 @@ button.confirm {
     border-color: var(--error);
 }
 button.confirm:hover { background: #ef4444; }
+
+/* ─── card rendering (zero-asset) ───────────────────────────── */
+/* Used by card-render.js / card-preview.html and any future card
+ * game (e.g. take_your_position). No external assets; suits are
+ * Unicode glyphs, ranks are 1–13 mapped to text.
+ *
+ * IMPORTANT: class names are prefixed `.play-card` (and `.play-table`,
+ * `.play-actions`, `.play-card-inline`) to avoid colliding with the
+ * existing `.card` panels used by the lobby / room pages.
+ *
+ * Wire format expected by card-render.js:
+ *   card = { s: 0..3, r: 0..12 }   // 0=Spade 1=Heart 2=Diamond 3=Club; 0=A 1=Two … 12=K
+ *   null/undefined                  // empty slot / face-down
+ */
+:root {
+    --card-w: 64px;
+    --card-h: 92px;
+    --card-radius: 6px;
+    --card-shadow: 0 2px 4px rgba(0,0,0,0.30), 0 0 0 1px rgba(0,0,0,0.10);
+    --card-bg: #fdfdfa;
+    --card-red: #c1272d;
+    --card-black: #111;
+    --card-back-from: #1e3a8a;
+    --card-back-to: #2563eb;
+}
+
+.play-card {
+    width: var(--card-w);
+    height: var(--card-h);
+    border-radius: var(--card-radius);
+    background: var(--card-bg);
+    box-shadow: var(--card-shadow);
+    display: inline-flex;
+    flex-direction: column;
+    justify-content: space-between;
+    padding: 4px 6px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--card-black);
+    user-select: none;
+    box-sizing: border-box;
+    position: relative;
+}
+.play-card.red   { color: var(--card-red); }
+/* Spades & clubs use blue (per user request — black was hard to read). */
+.play-card.black { color: #1d4ed8; }
+.play-card .corner {
+    font-weight: 700;
+    font-size: 14px;
+    line-height: 1.05;
+    text-align: left;
+}
+.play-card .corner .rank { display: block; }
+.play-card .corner .suit { display: block; font-size: 13px; }
+.play-card .corner.bot {
+    transform: rotate(180deg);
+    align-self: flex-end;
+}
+.play-card .pip {
+    align-self: center;
+    font-size: 30px;
+    line-height: 1;
+}
+
+/* ── card back (face-down / empty) ──────────────────────────── */
+.play-card.back {
+    background: linear-gradient(135deg, var(--card-back-from), var(--card-back-to));
+    color: #fff;
+    align-items: center;
+    justify-content: center;
+    font-size: 22px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+}
+.play-card.back::before {
+    content: "";
+    position: absolute;
+    inset: 4px;
+    border-radius: 4px;
+    border: 1px dashed rgba(255,255,255,0.45);
+}
+.play-card.back::after { content: ""; }  /* no ? mark — user request */
+.play-card.empty {
+    background: transparent;
+    border: 1px dashed rgba(255,255,255,0.20);
+    box-shadow: none;
+}
+.play-card.disabled { opacity: 0.5; cursor: default; }
+.play-card.clickable { cursor: pointer; }
+.play-card.clickable:hover { transform: translateY(-3px); }
+.play-card.selected { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* ── inline mode (compact list / log lines) ─────────────────── */
+.play-card-inline { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 14px; }
+.play-card-inline.red   { color: var(--card-red); }
+/* Spades & clubs use blue (matches .play-card.black). */
+.play-card-inline.black { color: #1d4ed8; }
+
+/* (Old .hand/.opponents/.play-table/.play-actions blocks removed — replaced by
+ * the .card-stage / .seat-panel layout below.) */
+
+/* ── preview page (card-preview.html) ───────────────────────── */
+.preview-section { padding: 16px; max-width: 880px; margin: 0 auto; }
+.preview-section h2 {
+    font-size: 14px;
+    color: var(--muted);
+    margin: 16px 0 8px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+.preview-grid {
+    display: grid;
+    grid-template-columns: repeat(13, var(--card-w));
+    gap: 6px;
+    overflow-x: auto;
+    padding: 4px;
+}
+.preview-suit-row {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+.preview-stage {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 8px;
+}
+
+/* ─── responsive ─────────────────────────────────────────── */
+@media (max-width: 520px) {
+    :root { --card-w: 52px; --card-h: 76px; }
+    .play-card .corner { font-size: 12px; }
+    .play-card .pip { font-size: 24px; }
+    .seat-panel { min-width: 160px; padding: 6px 8px; }
+    .card-stage { gap: 6px; padding: 4px; }
+}
+
+/* ─── round-summary (centered modal, text + score breakdown) ── */
+.round-summary {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px 24px;
+    min-width: 480px;
+    max-width: 640px;
+    z-index: 1200;
+    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.6);
+    animation: round-summary-in 0.18s ease-out;
+}
+@keyframes round-summary-in {
+    from { opacity: 0; transform: translate(-50%, -50%) scale(0.95); }
+    to   { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+}
+.round-summary-title {
+    font-size: 14px;
+    color: var(--muted);
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-align: center;
+    margin-bottom: 12px;
+}
+/* per-row grid: rank | name | card | 3 scores | total */
+.rs-row {
+    display: grid;
+    grid-template-columns: 40px 1fr 60px 56px 56px 56px 60px;
+    gap: 8px;
+    align-items: center;
+    padding: 5px 8px;
+    border-radius: 6px;
+    font-size: 13px;
+}
+.rs-row.rs-me { background: rgba(110, 168, 254, 0.12); }
+.rs-head {
+    color: var(--muted);
+    font-size: 11px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 4px;
+    font-weight: 600;
+}
+.rs-rank { text-align: center; font-weight: 700; color: var(--muted); }
+.rs-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rs-card { text-align: center; font-weight: 700; font-family: ui-monospace, monospace; }
+.rs-card-red  { color: var(--card-red); }
+.rs-card-blue { color: #1d4ed8; }
+.rs-num { text-align: center; color: var(--muted); }
+.rs-total { font-weight: 700; color: var(--text); }
+
+.rs-close {
+    display: block;
+    margin: 14px auto 0;
+    padding: 7px 24px;
+    border-radius: 6px;
+    background: var(--card-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-size: 13px;
+    cursor: pointer;
+}
+.rs-close:hover { background: var(--card); border-color: var(--text); }
+
+/* ─── card-game layout (5 seats around the table) ──────────── */
+/* Player positions: TL, TR, R, B (self), L. Self always at B; rotation
+ * depends on which seat the operator drew at game start. */
+.card-stage {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    grid-template-rows: auto 1fr auto;
+    gap: 12px;
+    max-width: 920px;
+    margin: 0 auto;
+    padding: 8px;
+}
+.card-stage .seat-tl { grid-column: 1; grid-row: 1; }
+.card-stage .seat-tr { grid-column: 3; grid-row: 1; }
+.card-stage .seat-l  { grid-column: 1; grid-row: 2; align-self: center; }
+.card-stage .seat-r  { grid-column: 3; grid-row: 2; align-self: center; }
+.card-stage .seat-b  { grid-column: 2; grid-row: 3; }
+.card-stage .center-area {
+    grid-column: 2; grid-row: 1 / 3;  /* span rows 1 and 2: top ≈ seat-tl/tr, bottom ≈ seat-b */
+    align-self: stretch; justify-self: center;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    padding: 8px 0;
+    min-height: 240px;
+}
+
+/* ── seat panel ──────────────────────────────────────────── */
+.seat-panel {
+    display: flex; flex-direction: column; gap: 6px;
+    background: var(--card-2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 8px 10px;
+    min-width: 200px;
+    position: relative;
+}
+.seat-panel.is-self {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 1px var(--accent), 0 4px 12px rgba(110, 168, 254, 0.20);
+}
+.seat-panel.is-active {
+    border-color: var(--ok);
+    box-shadow: 0 0 0 1px var(--ok);
+}
+.seat-panel.is-first-player {
+    border-color: var(--warn);
+}
+.seat-panel-header {
+    display: flex; align-items: center; gap: 8px;
+}
+.avatar {
+    width: 36px; height: 36px;
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    color: #fff;
+    font-weight: 700;
+    font-size: 15px;
+    flex-shrink: 0;
+}
+.seat-info { flex: 1; min-width: 0; }
+.seat-name { font-weight: 600; font-size: 14px; line-height: 1.2; }
+.seat-score { font-size: 12px; color: var(--muted); }
+
+/* ── prediction status (2 columns: green prior / yellow posterior) ── */
+.seat-predictions {
+    display: flex; gap: 8px;
+    font-size: 11px;
+}
+.seat-predictions .prior, .seat-predictions .posterior {
+    flex: 1; padding: 4px 6px; border-radius: 4px;
+    background: rgba(255,255,255,0.04);
+    min-height: 18px;
+}
+.seat-predictions .prior.committed {
+    color: #4ade80;  /* green */
+    background: rgba(74, 222, 128, 0.08);
+}
+.seat-predictions .posterior.committed {
+    color: #facc15;  /* yellow */
+    background: rgba(250, 204, 21, 0.08);
+}
+.seat-predictions .label {
+    color: var(--muted);
+    font-size: 10px;
+    margin-right: 2px;
+}
+
+/* ── posterior rank editor (only on first player's view) ── */
+.posterior-editor {
+    display: flex; gap: 4px;
+    margin-top: 4px;
+}
+.posterior-editor .rank-btn {
+    width: 22px; height: 22px;
+    padding: 0;
+    font-size: 11px;
+    font-weight: 700;
+    border-radius: 4px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    color: var(--text);
+    cursor: pointer;
+}
+.posterior-editor .rank-btn.assigned {
+    background: rgba(250, 204, 21, 0.20);
+    border-color: var(--warn);
+    color: #facc15;
+}
+.posterior-editor .rank-btn:disabled {
+    opacity: 0.3;
+    cursor: not-allowed;
+}
+
+/* ── committed card slot (next to panel during play) ── */
+.committed-slot {
+    width: var(--card-w);
+    height: var(--card-h);
+    align-self: center;
+}
+
+/* ── played history (small suit+rank row below panel) ── */
+.seat-history {
+    display: flex; gap: 4px; flex-wrap: wrap;
+    font-size: 11px;
+    color: var(--muted);
+    min-height: 14px;
+}
+.seat-history .card-inline { font-size: 11px; }
+
+/* ── action area (predict/posterior buttons) ── */
+.card-actions {
+    display: flex; flex-wrap: wrap;
+    gap: 8px; justify-content: center; align-items: center;
+    padding: 8px;
+    background: var(--card-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-top: 8px;
+}
+.card-actions .group {
+    display: flex; gap: 6px; align-items: center;
+}
+.card-actions .group label {
+    font-size: 12px; color: var(--muted); margin-right: 4px;
+}
+.card-actions button.confirm[disabled] {
+    opacity: 0.4; cursor: not-allowed;
+}
+.rank-pick {
+    width: 32px; height: 32px;
+    border-radius: 6px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-weight: 700;
+    font-size: 14px;
+    cursor: pointer;
+}
+.rank-pick.selected {
+    background: var(--accent);
+    color: #fff;
+    border-color: var(--accent);
+}
+.rank-pick:disabled {
+    opacity: 0.3; cursor: not-allowed;
+}
+
+/* ── center table (revealed after all 5 commit) ── */
+.center-table {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    justify-content: center;
+    padding: 8px;
+}
+.center-table .slot {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+}
+.center-table .slot .slot-name {
+    font-size: 11px;
+    color: var(--muted);
+}
+
+/* ── own hand at bottom ── */
+.hand {
+    display: flex;
+    justify-content: center;
+    align-items: flex-end;
+    gap: 8px;
+    padding: 8px;
+    min-height: calc(var(--card-h) + 16px);
+}
+.hand .play-card { transition: transform 0.15s ease; }
+.hand .play-card:nth-child(1)  { transform: rotate(-12deg) translateY(6px); }
+.hand .play-card:nth-child(2)  { transform: rotate( -6deg) translateY(2px); }
+.hand .play-card:nth-child(3)  { transform: rotate(  0deg); }
+.hand .play-card:nth-child(4)  { transform: rotate(  6deg) translateY(2px); }
+.hand .play-card:nth-child(5)  { transform: rotate( 12deg) translateY(6px); }
+.hand .play-card.clickable:hover { transform: translateY(-8px) rotate(0); }
+.hand .play-card.disabled { opacity: 0.4; cursor: default; }
+
+/* ─── center table (3 cols × 2 rows, 5 cards arranged by seat order) ──
+ * Layout: 2 cards on the left column, 1 card in the middle, 2 cards on the
+ * right column.
+ *
+ * Seat → grid cell mapping (relative to mySeatIdx):
+ *   seat 0 (self, bottom)     → middle, bottom row
+ *   seat 1 (right)            → left column, bottom row
+ *   seat 2 (top-right)        → left column, top row
+ *   seat 3 (top-left)         → right column, top row
+ *   seat 4 (left)             → right column, bottom row
+ */
+.center-table {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    grid-template-rows: 1fr 1fr;
+    gap: 8px;
+    width: 280px;
+    min-height: 220px;
+    margin: 8px auto;
+    padding: 12px;
+    border-radius: 12px;
+    background:
+        radial-gradient(ellipse at center, rgba(255,255,255,0.05), transparent 70%),
+        var(--card-2);
+    border: 1px solid var(--border);
+}
+.center-slot {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+}
+.center-slot .slot-name {
+    font-size: 10px;
+    color: var(--muted);
+}
+.center-slot .play-card { margin: 0; }
+.center-slot[data-pos="0"] { grid-column: 2; grid-row: 2; }  /* middle */
+.center-slot[data-pos="1"] { grid-column: 1; grid-row: 2; }  /* bottom-left */
+.center-slot[data-pos="2"] { grid-column: 1; grid-row: 1; }  /* top-left */
+.center-slot[data-pos="3"] { grid-column: 3; grid-row: 1; }  /* top-right */
+.center-slot[data-pos="4"] { grid-column: 3; grid-row: 2; }  /* bottom-right */
+
+/* ─── per-player posterior rank row (5 mini buttons) ── */
+.posterior-row {
+    display: flex;
+    gap: 3px;
+    margin-top: 4px;
+}
+.rank-mini {
+    width: 20px;
+    height: 20px;
+    padding: 0;
+    font-size: 10px;
+    font-weight: 700;
+    border-radius: 4px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    color: var(--text);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.rank-mini.assigned {
+    background: rgba(250, 204, 21, 0.20);
+    border-color: var(--warn);
+    color: #facc15;
+}
+.rank-mini:disabled { opacity: 0.3; cursor: not-allowed; }
+.rank-mini:not(:disabled):hover { border-color: var(--text); }
+
+/* ─── skip button (predict panel) — wider than rank-pick ─── */
+.rank-pick.skip {
+    width: auto;
+    min-width: 44px;
+    padding: 0 8px;
+    font-size: 12px;
+}
+.rank-pick.skip.selected {
+    background: var(--warn);
+    color: #1a1300;
+    border-color: var(--warn);
+}

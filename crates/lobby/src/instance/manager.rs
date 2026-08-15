@@ -358,6 +358,32 @@ impl InstanceManager {
         timed_out
     }
 
+    /// Push a freshly-issued session token to every running game instance.
+    /// Each game adds it to its in-memory session registry so users who re-logged
+    /// in after game start can still authenticate.
+    pub async fn broadcast_session(&self, uid: i64, session: &str) -> usize {
+        let line = format!(
+            "{{\"event\":\"add_session\",\"uid\":{uid},\"session\":\"{session}\"}}\n"
+        );
+        let g = self.instances.lock().await;
+        let mut pushed = 0usize;
+        for (id, h) in g.iter() {
+            if matches!(h.status, Status::Stopped | Status::Finished | Status::Abnormal) {
+                continue;
+            }
+            match h.stdin_tx.send(line.clone()).await {
+                Ok(()) => {
+                    info!(instance_id = id, uid, "session pushed to game stdin");
+                    pushed += 1;
+                }
+                Err(_) => {
+                    warn!(instance_id = id, "failed to push session (stdin closed)");
+                }
+            }
+        }
+        pushed
+    }
+
     /// Iterate active instances; stop everything (called on SIGTERM).
     pub async fn shutdown_all(&self) {
         let ids: Vec<i64> = self.instances.lock().await.keys().copied().collect();

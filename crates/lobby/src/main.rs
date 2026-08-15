@@ -148,6 +148,69 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Session sync: every 5s, find newly-created sessions and push them to
+    // every running game via stdin. Solves the "re-logged in after game
+    // start" case where the game's session list is stale.
+    {
+        let db = db.clone();
+        let instances = instances.clone();
+        // Start the cursor 30s before lobby boot so we catch any sessions
+        // created during restart transitions.
+        let boot_ts = chrono::Utc::now() - chrono::Duration::seconds(30);
+        let mut last_seen: String = boot_ts.format("%Y-%m-%d %H:%M:%S").to_string();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tick.tick().await;
+                let rows = sqlx::query_as::<_, (i64, String)>(
+                    "SELECT user_id, token FROM sessions
+                     WHERE created_at >= ?1
+                       AND expires_at >= datetime('now')
+                     ORDER BY created_at"
+                )
+                .bind(&last_seen)
+                .fetch_all(&db)
+                .await;
+                let rows = match rows {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "session sync query failed");
+                        continue;
+                    }
+                };
+                if rows.is_empty() { continue; }
+                let mut max_ts = last_seen.clone();
+                for (uid, token) in rows {
+                    let pushed = instances.broadcast_session(uid, &token).await;
+                    if pushed > 0 {
+                        tracing::info!(uid, pushed, "synced new session to running games");
+                    }
+                }
+                // Advance cursor to the newest created_at we saw this round.
+                if let Some((_, _)) = sqlx::query_as::<_, (String, String)>(
+                    "SELECT created_at, token FROM sessions
+                     WHERE expires_at >= datetime('now')
+                     ORDER BY created_at DESC LIMIT 1"
+                )
+                .fetch_one(&db)
+                .await
+                .ok()
+                {
+                    let last: (String, String) = sqlx::query_as(
+                        "SELECT created_at, token FROM sessions
+                         WHERE expires_at >= datetime('now')
+                         ORDER BY created_at DESC LIMIT 1"
+                    )
+                    .fetch_one(&db)
+                    .await
+                    .unwrap_or((last_seen.clone(), String::new()));
+                    if last.0 > max_ts { max_ts = last.0; }
+                }
+                last_seen = max_ts;
+            }
+        });
+    }
+
     // Orphan instance sweep: a previous lobby may have died mid-game, leaving
     // `game_instances.status IN ('starting','ready','running')` rows whose
     // sub-process is long gone and `rooms.status='Running'` without a live

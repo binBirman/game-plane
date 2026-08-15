@@ -121,10 +121,11 @@ pub async fn run<L: GameLogic>(init: LobbyInit) -> anyhow::Result<()> {
 
     let logic = Arc::new(Mutex::new(L::new(&init.players, &config)));
     let registry: ConnRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let sessions = Arc::new(SessionRegistry::new());
 
     let app = Router::new()
         .route("/ws", get(ws_handler::<L>))
-        .with_state((logic.clone(), registry.clone()));
+        .with_state((logic.clone(), registry.clone(), sessions.clone()));
     let listener = tokio::net::TcpListener::bind(&init.listen).await?;
     let port = listener.local_addr()?.port();
     info!(port, "ws listening");
@@ -153,6 +154,10 @@ pub async fn run<L: GameLogic>(init: LobbyInit) -> anyhow::Result<()> {
                         info!(reason, "stopping");
                         std::process::exit(0);
                     }
+                    LobbyEvent::AddSession { uid, session } => {
+                        sessions.add(uid, &session);
+                        info!(uid, "session added (pushed from lobby)");
+                    }
                 }
             }
         }
@@ -163,6 +168,26 @@ pub async fn run<L: GameLogic>(init: LobbyInit) -> anyhow::Result<()> {
 }
 
 // ─── internal ─────────────────────────────────────────────────────────
+
+/// Session registry that lobby can populate mid-game via stdin commands.
+/// Login is accepted if EITHER the game's `validate_session` says yes
+/// OR this registry contains the token (lobby-pushed sessions).
+#[derive(Default)]
+pub struct SessionRegistry {
+    sessions: std::sync::Mutex<HashMap<i64, std::collections::HashSet<String>>>,
+}
+
+impl SessionRegistry {
+    pub fn new() -> Self { Self::default() }
+    pub fn add(&self, uid: i64, session: &str) {
+        let mut m = self.sessions.lock().expect("session registry poisoned");
+        m.entry(uid).or_default().insert(session.to_string());
+    }
+    pub fn contains(&self, uid: i64, session: &str) -> bool {
+        let m = self.sessions.lock().expect("session registry poisoned");
+        m.get(&uid).is_some_and(|s| s.contains(session))
+    }
+}
 
 type ConnRegistry = Arc<Mutex<HashMap<i64, mpsc::Sender<ServerMsg>>>>;
 
@@ -207,22 +232,29 @@ enum LobbyEvent {
         #[serde(default)]
         reason: String,
     },
+    /// Lobby pushes a freshly-created session token (e.g. user re-logged in
+    /// after the game started). Adds to the session registry; subsequent
+    /// login/reconnect with this token succeeds.
+    #[serde(rename = "add_session")]
+    AddSession { uid: i64, session: String },
 }
 
 async fn ws_handler<L: GameLogic>(
     ws: WebSocketUpgrade,
-    axum::extract::State((logic, registry)): axum::extract::State<(
+    axum::extract::State((logic, registry, sessions)): axum::extract::State<(
         Arc<Mutex<L>>,
         ConnRegistry,
+        Arc<SessionRegistry>,
     )>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket::<L>(socket, logic, registry))
+    ws.on_upgrade(move |socket| handle_socket::<L>(socket, logic, registry, sessions))
 }
 
 async fn handle_socket<L: GameLogic>(
     socket: WebSocket,
     logic: Arc<Mutex<L>>,
     registry: ConnRegistry,
+    sessions: Arc<SessionRegistry>,
 ) {
     let (mut sender, mut receiver) = socket.split();
 
@@ -233,8 +265,9 @@ async fn handle_socket<L: GameLogic>(
         match receiver.next().await {
             Some(Ok(Message::Text(t))) => match serde_json::from_str::<ClientMsg>(&t) {
                 Ok(ClientMsg::Login { uid: u, session }) => {
-                    let valid = logic.lock().await.validate_session(u, &session);
-                    if valid {
+                    let from_logic = logic.lock().await.validate_session(u, &session);
+                    let from_registry = sessions.contains(u, &session);
+                    if from_logic || from_registry {
                         uid = u;
                         authed = true;
                     } else {
@@ -248,8 +281,9 @@ async fn handle_socket<L: GameLogic>(
                     }
                 }
                 Ok(ClientMsg::Reconnect { uid: u, session }) => {
-                    let valid = logic.lock().await.validate_session(u, &session);
-                    if valid {
+                    let from_logic = logic.lock().await.validate_session(u, &session);
+                    let from_registry = sessions.contains(u, &session);
+                    if from_logic || from_registry {
                         uid = u;
                         authed = true;
                     } else {
