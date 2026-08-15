@@ -360,6 +360,7 @@ async fn handle_socket<L: GameLogic>(
                     };
                     match outcome {
                         ActionOutcome::Ok => {
+                            println!("{{\"event\":\"action\"}}"); // lobby bumps last_action_at
                             broadcast_snapshot(&logic, &registry).await;
                         }
                         ActionOutcome::Reject(reason) => {
@@ -372,6 +373,7 @@ async fn handle_socket<L: GameLogic>(
                         }
                         ActionOutcome::GameOver => {
                             let _ = game_over; // suppress unused_assignments (loop exits via `break`)
+                            println!("{{\"event\":\"action\"}}"); // even final move keeps it alive
                             println!("{{\"event\":\"finished\"}}");
                             broadcast_snapshot(&logic, &registry).await;
                             break;

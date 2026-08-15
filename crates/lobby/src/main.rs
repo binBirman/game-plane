@@ -1,4 +1,5 @@
 mod auth;
+mod cleanup;
 mod config;
 mod db;
 mod games;
@@ -117,6 +118,9 @@ async fn main() -> Result<()> {
             cfg.rate_limit_captcha_per_min,
         ),
     });
+
+    // Stale-room cleanup task (Running-no-action / Waiting-no-viewer).
+    cleanup::spawn_cleanup_task(state.clone());
 
     // Watchdog: heartbeat timeouts every 5s
     {

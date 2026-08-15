@@ -52,6 +52,11 @@ pub enum GameEvent {
     Shutdown,
     #[serde(rename = "heartbeat")]
     Heartbeat,
+    /// A player took a game action (predict / play / posterior). Lobby bumps
+    /// `game_instances.last_action_at` so the stale-room cleanup can tell a
+    /// live game apart from an abandoned one.
+    #[serde(rename = "action")]
+    Action,
 }
 
 #[derive(Debug, Serialize)]
@@ -218,6 +223,15 @@ impl InstanceManager {
                         if let Some(h) = g.get_mut(&instance_id) {
                             h.last_heartbeat = Instant::now();
                         }
+                    }
+                    Ok(GameEvent::Action) => {
+                        // A player acted — keep the instance alive for cleanup.
+                        let _ = sqlx::query(
+                            "UPDATE game_instances SET last_action_at = datetime('now') WHERE instance_id=?",
+                        )
+                        .bind(instance_id)
+                        .execute(&db)
+                        .await;
                     }
                     Err(e) => {
                         warn!(instance_id, error=%e, line=%line, "bad event line");

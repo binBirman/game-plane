@@ -14,5 +14,19 @@ pub async fn run(pool: &SqlitePool) -> Result<()> {
         .execute(pool)
         .await;
 
+    // V1.2 — TYP support + cleanup task.
+    let _ = sqlx::query("ALTER TABLE rooms ADD COLUMN timer_preset TEXT NOT NULL DEFAULT '30+60'")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE room_players ADD COLUMN online INTEGER NOT NULL DEFAULT 1")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE game_instances ADD COLUMN last_action_at TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE rooms ADD COLUMN last_active_at TEXT")
+        .execute(pool)
+        .await;
+
     Ok(())
 }
