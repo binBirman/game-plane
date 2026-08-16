@@ -36,6 +36,22 @@ done
 BIN_SRC="$(cd "$(dirname "$0")" && pwd)/lobby"
 [[ -x "$BIN_SRC" ]] || { echo "ERROR: lobby binary not found in $(dirname "$BIN_SRC")" >&2; exit 1; }
 
+# On upgrade (service already installed), stop it first so we can swap the
+# binary cleanly and don't leave orphaned game subprocesses behind.
+if [[ $DO_RESTART -eq 1 ]] && systemctl list-unit-files lobby.service >/dev/null 2>&1 \
+   && systemctl is-active --quiet lobby.service 2>/dev/null; then
+    echo "==> stopping lobby.service for clean binary swap"
+    systemctl stop lobby.service
+    sleep 1
+fi
+# Kill any orphaned game subprocesses (stale binaries from a previous lobby).
+for p in /usr/local/bin/take_your_position /usr/local/bin/tictactoe; do
+    if pgrep -f "^$p" >/dev/null 2>&1; then
+        pkill -9 -f "^$p" 2>/dev/null || true
+        echo "    killed orphaned: $p"
+    fi
+done
+
 echo "==> creating system user 'lobby' (if missing)"
 if ! id -u lobby >/dev/null 2>&1; then
     useradd --system --no-create-home --shell /usr/sbin/nologin lobby
@@ -166,6 +182,11 @@ Verify it's actually serving the new binary:
     systemctl status lobby              # service state + latest log lines
     curl -s http://127.0.0.1:8192/api/games    # should list take_your_position
     PORT=8192 bash tools/test.sh        # 25 smoke tests
+
+For FUTURE upgrades (no manual delete needed, keeps DB + env):
+
+    cd /opt/lobby-<newver>
+    sudo ./upgrade.sh                   # stop → swap binaries → force games.toml → restart
 
 Live log:
 

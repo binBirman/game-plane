@@ -174,25 +174,33 @@ game-sdk 是独立的，但 spawn 需要 LobbyInit。最简单还是走 Lobby sp
 
 ```bash
 cd ~/dev/game-plane-main
-VERSION=0.2.0 bash build.sh
-# 产出 dist/lobby-0.2.0.tar.gz（musl 静态，含 3 个二进制 + games.toml + install.sh + DEPLOY.md + static）
-md5sum dist/lobby-0.2.0.tar.gz
+bash build.sh                 # 默认版本取自 Cargo.toml (workspace.package.version)
+# 产出 dist/lobby-0.3.0.tar.gz（musl 静态，含 3 个二进制 + games.toml + install.sh + upgrade.sh + DEPLOY.md + static）
+md5sum dist/lobby-0.3.0.tar.gz
 ```
 
 ### 6.2 上传 + 安装（目标服务器）
 
 ```bash
-scp dist/lobby-0.2.0.tar.gz root@SERVER:/opt/
+scp dist/lobby-0.3.0.tar.gz root@SERVER:/opt/
 ssh root@SERVER
 cd /opt
-md5sum lobby-0.2.0.tar.gz      # 核对（传错=旧包）
-systemctl stop lobby
-pkill -f take_your_position     # 清孤儿旧进程
-rm -rf lobby lobby-0.2.0
-tar xzf lobby-0.2.0.tar.gz
-cd lobby-0.2.0
+md5sum lobby-0.3.0.tar.gz      # 核对（传错=旧包）
+tar xzf lobby-0.3.0.tar.gz
+cd lobby-0.3.0
 ./install.sh --force-games-toml   # 必须 --force，否则旧 games.toml 不覆盖
 ```
+
+### 6.3 升级（推荐，不用手动删）
+
+包内含 `upgrade.sh`，一键完成：**停服务 → 杀孤儿 game 进程 → 换二进制 → 强制覆盖 games.toml → 重启 → 校验**，并**保留 DB 与 env**：
+
+```bash
+cd /opt/lobby-0.3.0
+sudo ./upgrade.sh
+```
+
+对比手动流程，`upgrade.sh` 省掉：`systemctl stop`、`pkill -f take_your_position`、`rm -rf 旧目录`、`md5sum` 核对（脚本自带校验 + 打印新 md5）。`install.sh` 也已内置孤儿进程清理。
 
 ### 6.3 配置 `/etc/lobby/lobby.env`
 
