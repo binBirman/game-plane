@@ -1,6 +1,6 @@
 //! `GameLogic` adapter wrapping the pure-rule `GameState`.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use async_trait::async_trait;
 use game_sdk::{ActionOutcome, GameLogic, PhaseInfo};
@@ -209,6 +209,14 @@ impl GameLogic for TakeYourPosition {
 
     fn handle_action(&mut self, uid: i64, action: Value) -> ActionOutcome {
         let kind = action.get("action").and_then(|v| v.as_str()).unwrap_or("");
+        let phase_before = self.state.phase.name();
+        let round_before = self.state.round;
+        game_sdk::game_log!(
+            debug, "action received",
+            uid = uid, kind = kind,
+            phase = phase_before,
+            round = round_before,
+        );
         let result = match kind {
             "predict" => self.state.apply_predict(
                 uid,
@@ -226,14 +234,23 @@ impl GameLogic for TakeYourPosition {
                     .map(|a| a.iter().filter_map(|x| x.as_i64()).collect())
                     .unwrap_or_default(),
             ),
-            "draft_posterior" => self.state.apply_posterior_draft(
-                uid,
-                action
-                    .get("rank_list")
-                    .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|x| x.as_i64()).collect())
-                    .unwrap_or_default(),
-            ),
+            "draft_posterior" => {
+                // New dict protocol: `assignments: { uid: rank, ... }`. The
+                // first player can pin any player to any rank in any order;
+                // apply_posterior_draft enforces uniqueness / range / known
+                // uids, and accepts partial drafts.
+                let mut assignments: BTreeMap<i64, u8> = BTreeMap::new();
+                if let Some(obj) = action.get("assignments").and_then(|v| v.as_object()) {
+                    for (k, v) in obj {
+                        if let (Some(uid), Some(rank)) = (k.parse::<i64>().ok(), v.as_u64()) {
+                            if rank <= u8::MAX as u64 {
+                                assignments.insert(uid, rank as u8);
+                            }
+                        }
+                    }
+                }
+                self.state.apply_posterior_draft(uid, assignments)
+            }
             "restart_vote" => {
                 if let Some(seat) = self.state.seat_of(uid) {
                     self.state.players[seat].restart_yes = action
@@ -267,8 +284,30 @@ impl GameLogic for TakeYourPosition {
                         self.state.settle_action(seat);
                     }
                 }
+                let phase_after_apply = self.state.phase.name();
+                let before_advance = self.state.round;
                 self.advance_phase(&mut events);
-                self.pending_events.extend(events);
+                let phase_after_advance = self.state.phase.name();
+                let round_after_advance = self.state.round;
+                self.pending_events.extend(events.clone());
+                let event_kinds: Vec<String> = events.iter().map(|e| match e {
+                    Event::PredictionAccepted { uid } => format!("PredictionAccepted uid={uid}"),
+                    Event::CardPlayed { uid } => format!("CardPlayed uid={uid}"),
+                    Event::PosteriorPredictionAccepted { uid } => format!("PosteriorPredictionAccepted uid={uid}"),
+                    Event::PhaseChanged { phase } => format!("PhaseChanged phase={phase}"),
+                    Event::RoundResult { round, .. } => format!("RoundResult round={round}"),
+                    Event::GameEnded { .. } => "GameEnded".into(),
+                }).collect();
+                game_sdk::game_log!(
+                    info, "action processed",
+                    uid = uid, kind = kind,
+                    phase_before = phase_before,
+                    phase_after_apply = phase_after_apply,
+                    phase_after_advance = phase_after_advance,
+                    round_before = round_before,
+                    round_after_advance = round_after_advance,
+                    events = event_kinds.join(";"),
+                );
                 if self.is_over() {
                     self.pending_events.push(self.state.end_game());
                     ActionOutcome::GameOver
@@ -276,7 +315,15 @@ impl GameLogic for TakeYourPosition {
                     ActionOutcome::Ok
                 }
             }
-            Err(e) => ActionOutcome::Reject(e.to_string()),
+            Err(e) => {
+                game_sdk::game_log!(
+                    warn, "action rejected",
+                    uid = uid, kind = kind,
+                    phase = phase_before, round = round_before,
+                    reason = e.to_string(),
+                );
+                ActionOutcome::Reject(e.to_string())
+            }
         }
     }
 
@@ -392,6 +439,11 @@ impl TakeYourPosition {
                 // Move current_player to next unacted; if all acted → Play.
                 if let Some(next) = self.state.next_unacted() {
                     self.state.current_player = Some(next);
+                    // Reset the new active player's thinking_since so the
+                    // wait time before their turn is NOT counted toward their
+                    // budget (otherwise the second player inherits the first
+                    // player's elapsed).
+                    self.state.start_thinking();
                     return;
                 }
                 self.state.phase = Phase::Play;
@@ -414,22 +466,44 @@ impl TakeYourPosition {
             Phase::PosteriorPrediction => {
                 let sp = self.state.start_player;
                 if self.state.players[sp].posterior_prediction.is_none() {
+                    game_sdk::game_log!(
+                        debug, "advance_phase: still waiting for first player",
+                        start_player = self.state.players[sp].uid,
+                        round = self.state.round,
+                    );
                     return;
                 }
+                let round_to_score = self.state.round;
+                game_sdk::game_log!(
+                    info, "round reveal: scoring",
+                    round = round_to_score,
+                    start_player = self.state.players[sp].uid,
+                );
                 // NOW reveal: move committed_card → table, append to history,
                 // then score the round.
                 self.state.reveal_plays();
                 events.push(self.state.finish_round());
                 self.state.round += 1;
+                let next_round = self.state.round;
                 if self.state.round >= 5 {
                     self.state.phase = Phase::End;
                     for p in &mut self.state.players {
                         p.thinking_since = None;
                     }
                     events.push(Event::PhaseChanged { phase: Phase::End.name().into() });
+                    game_sdk::game_log!(
+                        info, "round reveal: game ended",
+                        finished_round = round_to_score,
+                        next_round = next_round,
+                    );
                 } else {
                     self.state.begin_next_round();
                     events.push(Event::PhaseChanged { phase: Phase::PriorPrediction.name().into() });
+                    game_sdk::game_log!(
+                        info, "round reveal: next round",
+                        finished_round = round_to_score,
+                        next_round = next_round,
+                    );
                 }
             }
             Phase::WaitingAll => {

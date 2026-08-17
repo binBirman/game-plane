@@ -14,8 +14,11 @@ pub struct LoggingGuard {
 }
 
 pub fn init(cfg: &crate::config::Config) -> Result<LoggingGuard> {
+    // Default filter enables structured info-level logs from game subprocesses
+    // (via `lobby::game_log` span) and the `lobby::game_stderr` plain-text
+    // fallback at DEBUG. Override with `RUST_LOG` in `lobby.env` to tune.
     let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,lobby::db=warn"));
+        .unwrap_or_else(|_| EnvFilter::new("info,lobby::db=warn,lobby::game_stderr=debug"));
 
     if let Some(dir) = &cfg.log_file_dir {
         std::fs::create_dir_all(dir).with_context(|| format!("create log dir {dir}"))?;

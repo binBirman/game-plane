@@ -21,6 +21,9 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
+pub mod log;
+pub use log::Level;
+
 /// Initialize tracing for a game binary. Output goes to stderr so stdout
 /// stays clean for the JSON line protocol that Lobby reads.
 pub fn init_tracing() {
@@ -32,6 +35,54 @@ pub fn init_tracing() {
                 .unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+}
+
+/// Emit a structured log line to stderr in the [game-log protocol] format
+/// (one JSON object per line). `target` is automatically set to the calling
+/// module's path. `init_tracing()` is NOT required.
+///
+/// # Examples
+///
+/// ```ignore
+/// use game_sdk::game_log;
+///
+/// game_log!(info, "apply_posterior accepted", uid = 42, rank_count = 5);
+/// game_log!(warn, "out of time", uid = 42, phase = "play");
+/// game_log!(debug, "snapshot built", players = 5);
+/// ```
+///
+/// The macro emits a JSON line like:
+/// `{"ts":"2026-08-17T06:18:01.123456Z","level":"info","target":"foo::bar",
+/// "message":"apply_posterior accepted","fields":{"uid":42,"rank_count":5}}`
+///
+/// [game-log protocol]: ../../docs/game_log_protocol.md
+#[macro_export]
+macro_rules! game_log {
+    ($level:ident, $msg:expr $(, $field:ident = $value:expr)* $(,)?) => {{
+        // The macro receives the level as a lowercase identifier (e.g.
+        // `info`, `debug`) which matches `tracing::Level` and the wire
+        // format. The in-process `Level` enum uses CamelCase variants, so
+        // map at expansion time. An unknown level falls back to `Info`
+        // rather than a hard error so a typo never crashes the game.
+        let level = match ::std::stringify!($level) {
+            "trace" => $crate::Level::Trace,
+            "debug" => $crate::Level::Debug,
+            "info" => $crate::Level::Info,
+            "warn" => $crate::Level::Warn,
+            "error" => $crate::Level::Error,
+            _ => $crate::Level::Info,
+        };
+        let target = ::std::module_path!();
+        let msg: &str = $msg;
+        let mut fields = ::serde_json::Map::new();
+        $(
+            fields.insert(
+                ::std::stringify!($field).to_string(),
+                ::serde_json::json!($value),
+            );
+        )*
+        $crate::log::emit(level, target, msg, &fields);
+    }};
 }
 
 /// 当前阶段信息（推送给客户端，供 UI 展示）。

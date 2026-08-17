@@ -10,9 +10,69 @@ use sqlx::SqlitePool;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, Mutex};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Parsed shape of a single structured log line emitted by a game binary
+/// via `game_sdk::game_log!`. The lobby reads each stderr line from the
+/// game subprocess and tries to parse it as this; on success it re-emits
+/// the line via `tracing` at the original level/target with the fields
+/// inlined into the message. Lines that don't match (e.g. output from
+/// `tracing::info!` or any other free-text print) fall through to the
+/// plain-text `lobby::game_stderr` target at DEBUG level.
+///
+/// See `docs/game_log_protocol.md` for the wire format.
+#[derive(Debug, Deserialize)]
+struct GameLogEntry {
+    ts: String,
+    level: String,
+    target: String,
+    message: String,
+    #[serde(default)]
+    fields: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Forward a single stderr line from a game subprocess through this
+/// lobby's structured logging pipeline. Tries to parse as a structured
+/// `GameLogEntry` first; falls back to plain-text `lobby::game_stderr`
+/// at DEBUG level otherwise.
+fn emit_game_log(line: &str, instance_id: i64) {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if let Ok(entry) = serde_json::from_str::<GameLogEntry>(trimmed) {
+        // Inline fields as `key=value` so they survive JSON-stringification
+        // in the journal (tracing's default JSON formatter preserves Record
+        // fields but inlining is portable and grep-friendly).
+        let fields_str = entry
+            .fields
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let full_msg = if fields_str.is_empty() {
+            entry.message
+        } else {
+            format!("{} {}", entry.message, fields_str)
+        };
+        let span = tracing::info_span!("game_log", instance_id);
+        let _enter = span.enter();
+        match entry.level.as_str() {
+            "error" => tracing::error!(target = %entry.target, "{}", full_msg),
+            "warn"  => tracing::warn!(target = %entry.target, "{}", full_msg),
+            "info"  => tracing::info!(target = %entry.target, "{}", full_msg),
+            "debug" => tracing::debug!(target = %entry.target, "{}", full_msg),
+            "trace" => tracing::trace!(target = %entry.target, "{}", full_msg),
+            // Unknown level — be conservative and emit at DEBUG so a
+            // typo never becomes a noisy journal line.
+            _ => tracing::debug!(target = %entry.target, "{}", full_msg),
+        }
+    } else {
+        tracing::debug!(target: "lobby::game_stderr", instance_id, "{}", line);
+    }
+}
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,7 +217,7 @@ impl InstanceManager {
         tokio::spawn(async move {
             let mut reader = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = reader.next_line().await {
-                tracing::debug!(target: "lobby::game_stderr", instance_id, "{}", line);
+                emit_game_log(&line, instance_id);
             }
         });
 

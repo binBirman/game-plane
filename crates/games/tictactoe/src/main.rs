@@ -11,7 +11,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 #[derive(Default, Serialize, Deserialize, Clone)]
-pub struct TicTacToeConfig;
+pub struct TicTacToeConfig {
+    /// Injected by lobby from rooms.timer_preset; tictactoe has no timers, ignored.
+    #[serde(default)]
+    pub timer_preset: Option<String>,
+}
 
 struct TicTacToe {
     board: [Option<i64>; 9],

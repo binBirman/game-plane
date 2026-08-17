@@ -2,6 +2,35 @@
     "use strict";
 
     // ─── state ────────────────────────────────────────────────────────
+    // Persist a small slice of state to localStorage so that after a page
+    // refresh (state is otherwise reinitialised to zero) we can still render
+    // the room correctly — without this, getNickname returns null and every
+    // seat panel falls back to "uid=N". Specifically we persist:
+    //   - currentRoomId: the room the user is currently inside
+    //   - roomCache:     the cached RoomInfo for that room (has player
+    //                    uids and nicknames, which getNickname looks up)
+    function loadRoomCacheFromStorage() {
+        try {
+            const obj = JSON.parse(localStorage.getItem("lobby_room_cache") || "{}");
+            // JSON.stringify serialises Map keys as strings, so a key like
+            // number 5 becomes "5" in storage. The rest of the code looks
+            // up with the number (e.g. `state.roomCache.get(roomId)`) — a
+            // string key would make every lookup miss and force every
+            // getNickname() to fall back to "uid=N". Re-parse to numbers.
+            const m = new Map();
+            for (const [k, v] of Object.entries(obj)) {
+                const n = parseInt(k, 10);
+                if (!Number.isNaN(n)) m.set(n, v);
+            }
+            return m;
+        } catch { return new Map(); }
+    }
+    function saveRoomCacheToStorage() {
+        const obj = {};
+        for (const [k, v] of state.roomCache) obj[k] = v;
+        try { localStorage.setItem("lobby_room_cache", JSON.stringify(obj)); } catch {}
+    }
+
     const state = {
         token: localStorage.getItem("lobby_token") || "",
         uid: parseInt(localStorage.getItem("lobby_uid") || "0", 10),
@@ -9,7 +38,7 @@
         ws: null,
         wsInstance: 0,
         wsLog: [],
-        roomCache: new Map(),
+        roomCache: loadRoomCacheFromStorage(),
         lastRoomPlayerUids: new Set(),
         roomPollTimer: null,
         roomPollRoomId: 0,
@@ -17,7 +46,16 @@
         knownGames: new Map(),
         // The room_id of the page the user is currently inside. Tracked so
         // the game-over modal can route back to #room/<id> (not #lobby).
-        currentRoomId: 0,
+        // Persisted so a refresh on #game/<id> still has a valid room to
+        // look up nicknames against.
+        currentRoomId: parseInt(localStorage.getItem("lobby_current_room_id") || "0", 10),
+        // The game_type of the game view the user last entered (e.g.
+        // "take_your_position"). Persisted so that on a page refresh, the
+        // router at #game/<id> still picks the right renderer — the room
+        // cache is empty at refresh time, so without this hint we'd fall
+        // back to the default ("tictactoe") and the TYP DOM scaffold would
+        // never be created. Cleared when the user leaves the game view.
+        lastGameType: localStorage.getItem("lobby_last_game_type") || "",
     };
 
     // ─── game metadata (frontend cache of /api/games) ────────────────
@@ -438,13 +476,11 @@
             el("div", { id: "timer-row", class: "row hidden", style: "margin-top:10px" }, [
                 el("label", { style: "margin-right:8px" }, "限时"),
                 el("select", { id: "timer-preset" }, [
-                    el("option", { value: "30+60" }, "快速（30+60）"),
-                    el("option", { value: "40+120", selected: true }, "标准（40+120）"),
-                    el("option", { value: "60+180" }, "宽松（60+180）"),
-                    el("option", { value: "300+0" }, "超长（300+0）"),
+                    el("option", { value: "30+60" }, "快速（ 30+60 s ）"),
+                    el("option", { value: "40+120", selected: true }, "标准（ 40+120 s ）"),
+                    el("option", { value: "60+180" }, "宽松（ 60+180 s ）"),
+                    el("option", { value: "300+0" }, "超长（ 300+0 s ）"),
                 ]),
-                el("span", { class: "muted", style: "font-size:12px;margin-left:8px" },
-                    "快速/标准=每轮计时；宽松=整局共享；超长=预测5分钟、出牌不限时"),
             ]),
         ]);
         app.appendChild(createCard);
@@ -546,6 +582,7 @@
             const prev = state.roomCache.get(roomId);
             detectPlayerChanges(prev, r);
             state.roomCache.set(roomId, r);
+            saveRoomCacheToStorage();
             renderRoomDetail(r, { fromPoll: true });
             state.roomLastFetchAt = Date.now();
             const dot = $("#poll-dot");
@@ -595,6 +632,7 @@
     async function renderRoom(roomId) {
         stopRoomPolling();
         state.currentRoomId = roomId;
+        localStorage.setItem("lobby_current_room_id", String(roomId));
         $("#topbar").classList.remove("hidden");
         $("#user-info").textContent = `${state.nickname} (#${state.uid})`;
         const app = $("#app");
@@ -624,6 +662,7 @@
         try {
             const r = await apiGet(`/api/rooms/${roomId}`);
             state.roomCache.set(roomId, r);
+            saveRoomCacheToStorage();
             wrap.innerHTML = "";
             renderRoomDetail(r, { fromPoll: false });
             startRoomPolling(roomId);
@@ -893,6 +932,7 @@
             const r = await api(`/api/rooms/${id}/join`, {});
             toast("已加入房间", "ok");
             state.roomCache.set(id, r);
+            saveRoomCacheToStorage();
             renderRoomDetail(r, { fromPoll: false });
         } catch (e) {
             toast(e.message, "error");
@@ -961,13 +1001,33 @@
     let gameWs = null;
     let gameOverNavTimer = null;  // set when modal shows, cleared on hide/click
     let cardSelectedIndex = -1;   // index in own hand selected for play_card
+    let prevRenderedPhase = null; // last phase seen by renderCardBoard — used to
+                                  // detect transitions into "play" so we can
+                                  // clear the selection on a new round only.
     // Card-game UI state (TYP)
     let pendingPredictRank = undefined;  // 1..5 selected before confirm, null = 跳过, undefined = 未选
     let pendingPosteriorRanks = {};       // uid → 1..5 in-progress posterior assignment
     let typSnapshot = null;              // last snapshot for re-rendering from event handlers
     let shownRounds = new Set();          // round numbers already shown a summary banner for
+    let shownPosteriorReveals = new Set();// rounds whose committed posterior we've already shown the reveal for
+    let pendingGameOver = false;          // set when the 5th round ends; showGameOverForCard
+                                          // fires after the user closes the round-5 summary
+    // (round, uid) pairs whose first-time-commit "flash" highlight has already
+    // been applied. The flash highlights the row in the posterior theme
+    // yellow for 3 seconds so the user actually notices the rank changing
+    // from "—" / "(待编辑)" to "第 N 名" / "未预测".
+    let shownPosteriorFlash = new Set();
+    // Posterior reveal scheduling: when a reveal pops, RoundResult events
+    // that arrive during the 3-second window are queued and shown after.
+    let revealActiveAt = 0;
+    const roundSummaryQueue = [];
 
     function currentGameType() {
+        // Persisted hint survives page refresh on #game/<id> — see lastGameType
+        // in the state object. Without this, a refresh would route to the
+        // tictactoe renderer because state.currentRoomId / roomCache are empty
+        // until the user navigates back through the room page.
+        if (state.lastGameType) return state.lastGameType;
         const rid = state.currentRoomId;
         if (!rid) return "tictactoe";
         const cached = state.roomCache.get(rid);
@@ -986,6 +1046,11 @@
         app.appendChild(el("div", { class: "subtitle", id: "game-status" }, "连接中..."));
 
         const gt = currentGameType();
+        // Persist so a later refresh on #game/<id> still routes to the
+        // correct renderer. Cleared in the room / lobby navigation handlers
+        // when the user leaves the game view.
+        state.lastGameType = gt;
+        localStorage.setItem("lobby_last_game_type", gt);
         if (gt === "take_your_position") {
             renderCardGameStage(instanceId);
         } else {
@@ -1028,8 +1093,41 @@
         app.appendChild(el("div", { class: "hand", id: "card-hand" }, ""));
         app.appendChild(el("div", { class: "event-log", id: "game-log", style: "margin-top:16px" }, ""));
 
+        // Reset ALL per-game state before the new instance's first snapshot
+        // arrives. Without this, a second TYP in the same room inherits
+        // stale values from the first: shownRounds / shownPosteriorReveals
+        // would dedupe-skip the new round-0 summary, boardState / typSnapshot
+        // could still carry the previous game's pending_events, the
+        // 1-second countdown timer could keep ticking on stale data, and
+        // the game-over modal could still be sitting on top blocking the
+        // new round result popup.
+        boardState = null;
+        typSnapshot = null;
+        cardSelectedIndex = -1;
+        prevRenderedPhase = null;
         pendingPredictRank = undefined;
         pendingPosteriorRanks = {};
+        shownRounds = new Set();
+        shownPosteriorReveals = new Set();
+        shownPosteriorFlash = new Set();
+        revealActiveAt = 0;
+        roundSummaryQueue.length = 0;
+        pendingGameOver = false;
+        if (typCountdownTimer) {
+            clearInterval(typCountdownTimer);
+            typCountdownTimer = null;
+        }
+        typSnapshotAt = Date.now();
+        if (gameOverNavTimer) {
+            clearTimeout(gameOverNavTimer);
+            gameOverNavTimer = null;
+        }
+        // Hide any leftover game-over modal from the previous instance.
+        const prevModal = document.getElementById("game-over-modal");
+        if (prevModal) prevModal.classList.add("hidden");
+        // Remove any leftover round-summary banner.
+        const prevBanner = document.getElementById("round-summary-banner");
+        if (prevBanner) prevBanner.remove();
 
         const wsHost = location.host;
         const url = `ws://${wsHost}/ws/${instanceId}`;
@@ -1069,7 +1167,14 @@
             if (s.start_player !== myUid) pendingPosteriorRanks = {};
         } else if (s.phase === "play") {
             pendingPosteriorRanks = {};
-            cardSelectedIndex = -1;  // fresh selection each play step
+            // Only reset the card selection when entering "play" from a
+            // different phase (i.e. a new round). Do NOT reset on every
+            // render — that path is hit on every snapshot AND every 1s
+            // countdown tick AND inside the card click handler, and would
+            // wipe the player's selection before they can press Confirm.
+            if (prevRenderedPhase && prevRenderedPhase !== "play") {
+                cardSelectedIndex = -1;
+            }
         } else if (s.phase === "ended" || s.is_over) {
             pendingPosteriorRanks = {};
             pendingPredictRank = undefined;
@@ -1089,12 +1194,17 @@
             const uid = players[seatIdx];
             const container = $("#" + positions[phys]);
             if (!container) continue;
+            // Tag the seat with the player uid so the per-second countdown
+            // updater (updateTimeDisplays) can find the right time block
+            // without rebuilding the entire board.
+            container.dataset.uid = String(uid);
             container.appendChild(buildSeatPanel(s, seatIdx, uid, phys === 0));
         }
 
         renderCenterArea(s);
         renderOwnHand(s);
         renderActionPanel(s);
+        prevRenderedPhase = s.phase;
 
         if (status) {
             if (s.phase === "waiting_all") {
@@ -1123,7 +1233,37 @@
         }
 
         if (s.is_over || s.phase === "ended") {
-            showGameOverForCard(s);
+            // Defer the game-over screen until the round-5 summary closes.
+            // Spec: "last round: show round summary first, then the game-over
+            // page after the user dismisses the summary." For earlier rounds
+            // this branch is never reached (phase never reaches "ended" until
+            // round 5 finishes), so the flag is only ever set once.
+            pendingGameOver = true;
+        }
+
+        // Set the reveal-before-round-summary gate BEFORE the events loop runs.
+        // The trigger can't be `s.phase === "posterior_prediction"` because
+        // the backend's action handler transitions to PriorPrediction **in
+        // the same snapshot** that carries the posterior commitment (see
+        // logic.rs advance_phase on commit). So by the time the snapshot
+        // reaches the client, `s.phase` is already "prior_prediction" and
+        // the RoundResult event is sitting in `pending_events` waiting to
+        // fire. We anchor on the posterior commitment itself.
+        //
+        // The committed entry is on the FIRST player's (uid, list, bool)
+        // tuple — only theirs has `committed = true`. We can't use
+        // `s.start_player` to find it because `advance_phase` already
+        // rotated `start_player` to the next round (so the committed tuple
+        // belongs to the previous round's start_player, not the current
+        // snapshot's). Match on the bool flag instead.
+        if (Array.isArray(s.posterior)) {
+            const postEntry = s.posterior.find(([, , committed]) => committed);
+            if (postEntry) {
+                if (!shownPosteriorReveals.has(s.round)) {
+                    shownPosteriorReveals.add(s.round);
+                    revealActiveAt = Date.now() + 3000;
+                }
+            }
         }
 
         const events = s.pending_events || [];
@@ -1131,10 +1271,18 @@
             gameLog("· " + JSON.stringify(ev));
             if (ev && ev.kind === "RoundResult") {
                 // Show the banner once per round — pending_events repeats across
-                // snapshots, so dedupe by round number.
+                // snapshots, so dedupe by round number. If a posterior reveal
+                // is currently on screen, delay this banner by enough ms to
+                // let the reveal finish first (the user sees "后验排名" for
+                // 3 s, then the round result page).
                 if (!shownRounds.has(ev.round)) {
-                    showRoundSummary(ev);
                     shownRounds.add(ev.round);
+                    const delay = Math.max(0, revealActiveAt - Date.now());
+                    if (delay > 0) {
+                        setTimeout(() => showRoundSummary(ev), delay);
+                    } else {
+                        showRoundSummary(ev);
+                    }
                 }
             }
         });
@@ -1146,6 +1294,10 @@
     let typCountdownTimer = null;
     let typSnapshotAt = Date.now();
     function startTypCountdown(s) {
+        // Reset the decay baseline only when a fresh server snapshot arrives
+        // (this function is called from renderCardBoard). The per-second tick
+        // must NOT reset it — otherwise `Date.now() - typSnapshotAt` is always
+        // ~0 ms when buildTimeEl runs, so the time displays never tick down.
         typSnapshotAt = Date.now();
         if (typCountdownTimer) return;
         typCountdownTimer = setInterval(() => {
@@ -1155,29 +1307,96 @@
                 typCountdownTimer = null;
                 return;
             }
-            // Re-render seat panels (rebuild shows decayed time via buildTimeEl).
-            renderCardBoard(typSnapshot);
+            // Only refresh the time display in each seat panel. The previous
+            // implementation called the full renderCardBoard here, which
+            // (a) wiped the player's in-progress card selection, and
+            // (b) rebuilt every DOM element on every tick, causing flicker.
+            // It also made per-client countdown visibly drift because each
+            // client ran the re-render on its own local snapshot.
+            updateTimeDisplays(typSnapshot);
         }, 1000);
+    }
+
+    // Refresh only the .seat-time blocks in each seat container. Seats are
+    // looked up by data-uid (set in renderCardBoard) so we don't need to
+    // recompute seat indices.
+    function updateTimeDisplays(s) {
+        const positions = ["seat-b", "seat-l", "seat-tl", "seat-tr", "seat-r"];
+        for (const id of positions) {
+            const seatEl = $("#" + id);
+            if (!seatEl) continue;
+            const uidAttr = seatEl.dataset.uid;
+            if (!uidAttr) continue;
+            const uid = parseInt(uidAttr, 10);
+            if (Number.isNaN(uid)) continue;
+            const oldTime = seatEl.querySelector(".seat-time");
+            if (!oldTime) continue;
+            const newTime = buildTimeEl(s, uid);
+            if (newTime) oldTime.replaceWith(newTime);
+        }
     }
 
     // Time display: A (refresh, white) + B (reserve, orange). Zero pools are
     // hidden and the '+' sign goes away. If both are present, '+' is orange.
-    // The displayed values decay by (now - snapshotAt) — A drains first, then B.
+    //
+    // The snapshot gives each player `time_a_ms`, `time_b_ms` (the FULL pools,
+    // before any current thinking deduction) and `remaining_ms` (the actual
+    // remaining time at the moment of the snapshot, with the ongoing thinking
+    // interval already deducted by the server). The previous implementation
+    // applied `decayMs` to every player's remaining time uniformly — a player
+    // watching the table would see their own clock tick down while another
+    // player is deliberating, which is wrong: their clock is paused.
+    //
+    // The server's `start_thinking` only sets `thinking_since` for the
+    // player(s) actually expected to act this step:
+    //   - PriorPrediction: only `current_player`
+    //   - Play: every player who hasn't yet committed a card (so a player
+    //     who has already played should NOT see their clock keep ticking)
+    //   - PosteriorPrediction: only `start_player`
+    // So the client's `decayMs` (time since the snapshot arrived locally)
+    // should only be subtracted for the active thinker(s). For everyone
+    // else, the clock is paused at the snapshot's frozen value.
+    //
+    // Correct A/B split (A drains first, then B): from
+    //   totalElapsed = aMs + bMs - remaining
+    //   A_rem = max(0, aMs - totalElapsed)
+    //   B_rem = max(0, remaining - A_rem)
     function buildTimeEl(s, uid) {
         const t = (s.times || []).find(([u]) => u === uid);
         if (!t) return null;
-        let [, aMs, bMs, _rem] = t;
-        // Decay by seconds elapsed since this snapshot (only while the game is
-        // in a timed phase and the player is expected to act).
+        let [, aFull, bFull, remInit] = t;
         const inPhase = s.phase === "prior_prediction" || s.phase === "play" || s.phase === "posterior_prediction";
+        let aRem, bRem;
         if (inPhase) {
-            const decayMs = Math.max(0, Date.now() - typSnapshotAt);
-            const takeA = Math.min(aMs, decayMs);
-            aMs -= takeA;
-            bMs = bMs > (decayMs - takeA) ? bMs - (decayMs - takeA) : 0;
+            let isActiveThinker;
+            if (s.phase === "prior_prediction") {
+                isActiveThinker = s.current_player === uid;
+            } else if (s.phase === "play") {
+                // All five players decide their card simultaneously — but
+                // once a player has committed their card, the backend's
+                // settle_action deducts elapsed and refills A, and their
+                // thinking clock is effectively paused. Use `s.committed`
+                // (per-player `(uid, card | null)`) to decide: a player
+                // whose entry is `null` is still deciding; a player whose
+                // entry is `Some(card)` has already locked in their move.
+                const committedEntry = (s.committed || []).find(([u]) => u === uid);
+                const hasCommitted = !!(committedEntry && committedEntry[1] != null);
+                isActiveThinker = !hasCommitted;
+            } else {
+                // posterior_prediction
+                isActiveThinker = s.start_player === uid;
+            }
+            const decayMs = isActiveThinker ? Math.max(0, Date.now() - typSnapshotAt) : 0;
+            const remaining = Math.max(0, remInit - decayMs);
+            const totalElapsed = (aFull + bFull) - remaining;
+            aRem = Math.max(0, aFull - totalElapsed);
+            bRem = Math.max(0, remaining - aRem);
+        } else {
+            aRem = aFull;
+            bRem = bFull;
         }
-        const aSecs = Math.ceil(aMs / 1000);
-        const bSecs = Math.ceil(bMs / 1000);
+        const aSecs = Math.ceil(aRem / 1000);
+        const bSecs = Math.ceil(bRem / 1000);
         const wrap = el("div", { class: "seat-time" });
         if (aSecs > 0) {
             wrap.appendChild(el("span", { class: "time-a" }, `${aSecs}s`));
@@ -1218,8 +1437,12 @@
 
         // Player time: refresh pool (white) + reserve pool (orange).
         // e.g. "30s + 60s"; hides a zero pool and its '+' sign.
-        const timeEl = buildTimeEl(s, uid);
-        if (timeEl) panel.appendChild(timeEl);
+        // Only show for the local player — other players' remaining time
+        // is just noise here (the viewer can only act on their own clock).
+        if (isSelf) {
+            const timeEl = buildTimeEl(s, uid);
+            if (timeEl) panel.appendChild(timeEl);
+        }
 
         const preds = el("div", { class: "seat-predictions" });
         const priorText = data.predictionCommitted
@@ -1232,17 +1455,45 @@
             el("span", { class: "label" }, "先验"),
             priorText,
         ]));
+        // Posterior: rank is determined by the FIRST player's committed list
+        // (it covers all 5 players). For every other player the snapshot's
+        // `posterior` field is null — we have to look up the first player's
+        // entry and find the index of `uid` in their list. Skip shows "未预测"
+        // for everyone. Format mirrors the prior ("第 N 名") so the seat
+        // panel reads like a single column; the .committed class picks up
+        // the posterior yellow theme color.
+        //
+        // Find the committed entry by the `committed` flag, not by matching
+        // `s.start_player` — the action handler transitions to the next
+        // round before broadcasting, so the snapshot's `s.start_player` is
+        // the NEXT round's start_player (committed=null), not the one who
+        // just committed.
+        const postEntry = (s.posterior || []).find(([, , committed]) => committed);
+        const startCommitted = !!postEntry;
+        const committedList = postEntry ? postEntry[1] : null;
         const postText = (() => {
-            if (data.posteriorCommitted) {
-                if (!data.posterior || data.posterior.length === 0) return "跳过";
-                const idx = data.posterior.indexOf(uid);
-                return idx >= 0 ? `#${idx + 1}` : "—";
+            if (startCommitted) {
+                if (!Array.isArray(committedList) || committedList.length === 0) return "未预测";
+                const idx = committedList.indexOf(uid);
+                return idx >= 0 ? `第 ${idx + 1} 名` : "—";
             }
             if (s.phase === "posterior_prediction" && s.start_player === uid) return "(待编辑)";
             return "—";
         })();
-        const postCls = data.posteriorCommitted ? "committed" : "";
-        preds.appendChild(el("div", { class: "posterior " + postCls }, [
+        const postCls = startCommitted ? "committed" : "";
+        // 3-second highlight when the seat panel first shows the committed
+        // rank. The first snapshot for a given (round, uid) gets the
+        // `flash` class; subsequent snapshots don't. CSS animates the
+        // background pulse and removes the highlight after 3 s.
+        let flashCls = "";
+        if (startCommitted) {
+            const flashKey = s.round + ":" + uid;
+            if (!shownPosteriorFlash.has(flashKey)) {
+                shownPosteriorFlash.add(flashKey);
+                flashCls = "flash";
+            }
+        }
+        preds.appendChild(el("div", { class: "posterior " + postCls + (flashCls ? " " + flashCls : "") }, [
             el("span", { class: "label" }, "后验"),
             postText,
         ]));
@@ -1296,37 +1547,74 @@
     }
 
     function buildPosteriorRankRow(s, forUid) {
+        // Free-rank assignment UI: a 5x5 grid where the row is the player
+        // and the columns are ranks 1..5. Clicking a cell pins that player
+        // to that rank; clicking the same cell again unpins. Any other
+        // player's pin for the same rank is replaced (the system enforces
+        // "no duplicates" by construction here; the backend re-validates).
+        //
+        // State lives server-side as a dict `{ uid: rank }` in
+        // `s.posterior_draft`. The first player can pick any rank for any
+        // player in any order — there's no "fill in order" constraint any
+        // more.
         const isEditor = s.start_player === myUid;
         const row = el("div", { class: "posterior-row" });
-        // The shared draft is `s.posterior_draft` (uids best→worst), synced in
-        // real time via draft_posterior. Rank of this player = index+1 in it.
-        const draft = Array.isArray(s.posterior_draft) ? s.posterior_draft : [];
-        const assignedRank = draft.indexOf(forUid) + 1;
+        // Defensive: backend may send a stale list (older binary) or a fresh
+        // dict. Coerce to dict for the rendering code below.
+        const draft = coercePosteriorDraft(s.posterior_draft);
+        const myRank = draft[forUid] || 0;
         for (let r = 1; r <= 5; r++) {
             const btn = el("button", { class: "rank-mini" }, String(r));
-            if (assignedRank === r) btn.classList.add("assigned");
+            if (myRank === r) btn.classList.add("assigned");
             if (!isEditor) {
                 btn.disabled = true;
                 btn.title = "";
                 row.appendChild(btn);
                 continue;
             }
-            // Editor: disable ranks already taken by another player in the draft.
-            const usedByOther = draft.some((u, idx) => u !== forUid && idx + 1 === r);
-            if (usedByOther) btn.disabled = true;
+            // Disable rank r if it's already pinned to ANOTHER player. The
+            // player who currently holds rank r can still click it (toggle
+            // off). Disabled-state tooltip explains why.
+            const occupiedByOther = Object.entries(draft).some(([u, rank]) =>
+                Number(u) !== forUid && Number(rank) === r);
+            btn.disabled = occupiedByOther;
+            if (btn.disabled) {
+                btn.title = `第 ${r} 名已被其他玩家占用`;
+            }
             btn.addEventListener("click", () => {
-                // Build a new draft: remove this player, then insert at rank r.
-                let next = draft.filter(u => u !== forUid);
-                if (assignedRank !== r) {
-                    next.splice(r - 1, 0, forUid);
+                if (btn.disabled) return;
+                const next = { ...draft };
+                if (myRank === r) {
+                    delete next[forUid];
+                } else {
+                    next[forUid] = r;
                 }
-                pendingPosteriorRanks = draftToMap(next);
-                sendCardAction({ action: "draft_posterior", rank_list: next });
+                sendCardAction({ action: "draft_posterior", assignments: next });
                 renderCardBoard(typSnapshot);
             });
             row.appendChild(btn);
         }
         return row;
+    }
+
+    // Normalise whatever shape `s.posterior_draft` arrived in (a dict from
+    // the current backend, or — during a binary skew / rollout — a stale
+    // flat array from an older build) into `{ uid: rank }`.
+    function coercePosteriorDraft(raw) {
+        const out = {};
+        if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+            for (const [k, v] of Object.entries(raw)) {
+                const uid = parseInt(k, 10);
+                const r = Number(v);
+                if (!Number.isNaN(uid) && !Number.isNaN(r) && r >= 1) out[uid] = r;
+            }
+        } else if (Array.isArray(raw)) {
+            raw.forEach((uid, idx) => {
+                const u = parseInt(uid, 10);
+                if (!Number.isNaN(u)) out[u] = idx + 1;
+            });
+        }
+        return out;
     }
 
     function draftToMap(draft) {
@@ -1355,7 +1643,13 @@
             const committedMap = new Map(s.committed || []);
             for (let i = 0; i < players.length; i++) {
                 const uid = players[i];
-                const rel = (i - mySeatIdx + 5) % 5;
+                // rel must mirror the seat-panel direction (counter-clockwise
+                // from self in `players[]` order): the player one seat to the
+                // left of self in the panel must have their card on the bottom-
+                // left of the table (data-pos=1), not the bottom-right (data-
+                // pos=4). The previous `(i - mySeatIdx + 5) % 5` went the
+                // opposite way and put every non-self card on the wrong side.
+                const rel = (mySeatIdx - i + 5) % 5;
                 const committed = committedMap.get(uid);
                 let card;
                 if (committed && committed.hidden === false) {
@@ -1379,7 +1673,9 @@
             const tableMap = new Map(s.table || []);
             for (let i = 0; i < players.length; i++) {
                 const uid = players[i];
-                const rel = (i - mySeatIdx + 5) % 5;
+                // Same direction as the seat panels and the play-phase slot
+                // loop above — see comment there.
+                const rel = (mySeatIdx - i + 5) % 5;
                 const cardData = tableMap.get(uid);
                 const card = cardData
                     ? window.cardRender.renderCardEl({ s: cardData.s, r: cardData.r })
@@ -1410,7 +1706,13 @@
                 onClick: () => {
                     if (cardSelectedIndex === idx) cardSelectedIndex = -1;
                     else cardSelectedIndex = idx;
-                    renderCardBoard(typSnapshot);
+                    // Re-render only the hand + action panel — the full
+                    // renderCardBoard would rebuild every seat panel, which
+                    // (a) is expensive, (b) destroys DOM nodes that may be in
+                    // the middle of being interacted with, and (c) re-enters
+                    // the play-phase branch that resets selection state.
+                    renderOwnHand(typSnapshot);
+                    renderActionPanel(typSnapshot);
                 },
             });
             handEl.appendChild(card);
@@ -1520,18 +1822,30 @@
             return group;
         }
 
-        // Confirm uses the live-shared draft (s.posterior_draft) as the order.
-        const draft = Array.isArray(s.posterior_draft) ? s.posterior_draft : [];
-        const allPresent = (s.players || []).every(uid => draft.includes(uid));
-        const allUnique = allPresent && draft.length === (s.players || []).length
-            && new Set(draft).size === draft.length;
+        // "Upload" is enabled only when every player is pinned to a distinct
+        // rank (5 unique ranks covering all 5 players). The dict→list
+        // conversion happens at click time, not on every keystroke, so the
+        // UI doesn't churn while the first player is still picking.
+        const draft = coercePosteriorDraft(s.posterior_draft);
+        const players = s.players || [];
+        const allPinned = players.length > 0 && players.every(uid => draft[uid] != null);
+        const ranksUsed = Object.values(draft);
+        const allUnique = new Set(ranksUsed).size === ranksUsed.length;
+        const ready = allPinned && allUnique && ranksUsed.length === players.length;
 
-        const confirm = el("button", { class: "primary confirm" }, "确认");
-        confirm.disabled = !allUnique;
-        confirm.title = allUnique ? "" : "需要给所有 5 名玩家各分配一个不重复的名次";
+        const confirm = el("button", { class: "primary confirm" }, "上传");
+        confirm.disabled = !ready;
+        confirm.title = ready ? "" : "需要给所有玩家各分配一个不重复的名次";
         confirm.addEventListener("click", () => {
-            if (!allUnique) return;
-            sendCardAction({ action: "posterior_predict", rank_list: draft });
+            if (!ready) return;
+            // Convert the dict to a best→worst list (rank 1 first, rank n last)
+            // for the wire — the backend still validates the list strictly.
+            const list = [];
+            for (let r = 1; r <= players.length; r++) {
+                const uid = Object.entries(draft).find(([_, rank]) => Number(rank) === r)?.[0];
+                if (uid) list.push(parseInt(uid, 10));
+            }
+            sendCardAction({ action: "posterior_predict", rank_list: list });
         });
         group.appendChild(confirm);
 
@@ -1542,6 +1856,28 @@
         group.appendChild(skip);
 
         return group;
+    }
+
+    // Pop a centered 3-second overlay listing the first player's committed
+    // posterior prediction (best → worst). Triggered from renderCardBoard on
+    // the transition into "posterior_prediction committed" within a round.
+    function showPosteriorReveal(rankList) {
+        const overlay = el("div", { class: "posterior-reveal-overlay" }, [
+            el("div", { class: "posterior-reveal" }, [
+                el("div", { class: "posterior-reveal-title" }, "后验预测"),
+                el("ol", { class: "posterior-reveal-list" },
+                    rankList.map((uid, idx) =>
+                        el("li", { class: "posterior-reveal-item" }, [
+                            el("span", { class: "rank-num" }, String(idx + 1)),
+                            el("span", { class: "rank-name" }, getNickname(uid) || `uid=${uid}`),
+                        ])
+                    )
+                ),
+                el("div", { class: "posterior-reveal-hint" }, "3 秒后自动关闭"),
+            ]),
+        ]);
+        document.body.appendChild(overlay);
+        setTimeout(() => overlay.remove(), 3000);
     }
 
     function buildRestartVotePanel(s) {
@@ -1630,15 +1966,22 @@
         });
 
         // Close button — dismiss the modal manually (otherwise auto-closes in 15s).
-        const close = el("button", { class: "rs-close" }, "关闭");
-        close.addEventListener("click", () => {
+        // If this is the round-5 summary (game over pending), reveal the final
+        // scores AFTER the user has had a chance to read the round result.
+        const finishIfPending = () => {
             if (wrap.parentNode) wrap.remove();
-        });
+            if (pendingGameOver) {
+                pendingGameOver = false;
+                if (typSnapshot) showGameOverForCard(typSnapshot);
+            }
+        };
+        const close = el("button", { class: "rs-close" }, "关闭");
+        close.addEventListener("click", finishIfPending);
         wrap.appendChild(close);
 
         document.body.appendChild(wrap);
         // Longer display, centered; user can close earlier with the button.
-        setTimeout(() => { if (wrap.parentNode) wrap.remove(); }, 15000);
+        setTimeout(finishIfPending, 15000);
     }
 
     function fmtDelta(v) {
@@ -1668,12 +2011,35 @@
         }
         if (finalBoard) {
             finalBoard.innerHTML = "";
-            (s.players || []).forEach((uid, seatIdx) => {
-                const sc = (s.scores || []).find(([u]) => u === uid);
-                const score = sc ? sc[1] : 0;
-                const cell = el("div", { class: "cell" },
-                    `${uid === myUid ? "你" : (getNickname(uid) || "P" + seatIdx)}: ${score}`);
-                finalBoard.appendChild(cell);
+            // Use a vertical ranked list (one row per player, sorted by
+            // score high→low). The .cell class is shared with tictactoe's
+            // 3×3 grid; the .final-rank-* classes below only apply to TYP
+            // and lay things out as a single column.
+            finalBoard.classList.add("final-rank-list");
+            const final = s.pending_events && s.pending_events.find(e => e.kind === "GameEnded");
+            const scores = (final && final.final_scores) || (s.scores || []);
+            const ranked = scores
+                .slice()
+                .sort((a, b) => b[1] - a[1]);
+            if (ranked.length === 0) {
+                // Fallback: derive from s.players / s.scores if no GameEnded
+                // event arrived (e.g. lobby restarted the snapshot).
+                (s.players || []).forEach(uid => {
+                    const sc = (s.scores || []).find(([u]) => u === uid);
+                    ranked.push([uid, sc ? sc[1] : 0]);
+                });
+                ranked.sort((a, b) => b[1] - a[1]);
+            }
+            ranked.forEach(([uid, score], idx) => {
+                const isMe = uid === myUid;
+                const row = el("div",
+                    { class: "cell final-rank-row" + (isMe ? " final-rank-me" : "") },
+                    [
+                        el("span", { class: "final-rank-num" }, String(idx + 1)),
+                        el("span", { class: "final-rank-name" }, isMe ? "你" : (getNickname(uid) || `uid=${uid}`)),
+                        el("span", { class: "final-rank-score" }, `${score} 分`),
+                    ]);
+                finalBoard.appendChild(row);
             });
         }
         modal.classList.remove("hidden");
@@ -1899,6 +2265,14 @@
         // Stop room polling when leaving the room view.
         if (m[1] !== "room" && state.roomPollTimer) {
             stopRoomPolling();
+        }
+        // Once we leave the game view (#game/<id>), the persisted hint is no
+        // longer authoritative — the next render sets it again. This keeps a
+        // stale entry from a previous game (e.g. take_your_position) from
+        // hijacking the router when the user navigates elsewhere.
+        if (m[1] !== "game") {
+            state.lastGameType = "";
+            localStorage.removeItem("lobby_last_game_type");
         }
         switch (m[1]) {
             case "login": renderAuth(); break;

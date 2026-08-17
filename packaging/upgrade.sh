@@ -2,7 +2,7 @@
 # One-command in-place upgrade for an existing lobby deployment.
 #
 # Run this from the extracted tarball directory, exactly like install.sh:
-#   cd /opt/lobby-0.3.0
+#   cd /opt/lobby-<version>
 #   sudo ./upgrade.sh
 #
 # It does everything install.sh does PLUS the things you'd otherwise have to

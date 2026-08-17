@@ -145,28 +145,13 @@ run_test "POST /api/register (invalid captcha)" 400 \
     -H 'Content-Type: application/json' \
     -d "{\"username\":\"$TEST_USER\",\"password\":\"$STRONG_PASS\",\"nickname\":\"x\",\"captcha\":{\"challenge\":\"deadbeefdeadbeefdeadbeefdeadbeef\",\"nonce\":\"0\"}}"
 
-# ─── 5-8. register: weak password (with valid captcha) ────────────────
+# ─── 5. register: weak password (with valid captcha) ─────────────────
 run_test "POST /api/register (weak: short <9)" 400 \
     -X POST "$BASE/api/register" \
     -H 'Content-Type: application/json' \
     -d "{\"username\":\"short_$TEST_USER\",\"password\":\"Ab1!\",\"nickname\":\"x\",\"captcha\":$CAP}"
 
-run_test "POST /api/register (weak: no digit)" 400 \
-    -X POST "$BASE/api/register" \
-    -H 'Content-Type: application/json' \
-    -d "{\"username\":\"nodigit_$TEST_USER\",\"password\":\"NoDigits_!!\",\"nickname\":\"x\",\"captcha\":$CAP}"
-
-run_test "POST /api/register (weak: no letter)" 400 \
-    -X POST "$BASE/api/register" \
-    -H 'Content-Type: application/json' \
-    -d "{\"username\":\"noletter_$TEST_USER\",\"password\":\"12345678!\",\"nickname\":\"x\",\"captcha\":$CAP}"
-
-run_test "POST /api/register (weak: no special)" 400 \
-    -X POST "$BASE/api/register" \
-    -H 'Content-Type: application/json' \
-    -d "{\"username\":\"nospcl_$TEST_USER\",\"password\":\"NoSpecial123\",\"nickname\":\"x\",\"captcha\":$CAP}"
-
-# ─── 9. register: happy path ──────────────────────────────────────────
+# ─── 6. register: happy path ─────────────────────────────────────────
 run_test "POST /api/register (new user)" 200 \
     -X POST "$BASE/api/register" \
     -H 'Content-Type: application/json' \

@@ -118,11 +118,13 @@ pub struct GameState {
     /// uids that have successfully authenticated (login/reconnect) — used to
     /// delay the first round until everyone is in.
     pub joined: std::collections::HashSet<i64>,
-    /// In-progress posterior prediction draft (best→worst uids). First player
-    /// edits this live via `draft_posterior`; the frontend sees it in
-    /// snapshots so everyone watches the selection in real time. Only the
-    /// committed posterior (via `posterior_predict`) counts for scoring.
-    pub posterior_draft: Vec<i64>,
+    /// In-progress posterior prediction draft: `{ uid → rank (1..=n) }`.
+    /// The frontend sends a dict (each entry pins a player to a rank) so the
+    /// first player can assign any player to any rank in any order without
+    /// the flat-list "fill in order" constraint. Stored as a dict so we can
+    /// validate rank-uniqueness and accept partial drafts; converted to a
+    /// best→worst `Vec<i64>` only at commit time (see `apply_posterior`).
+    pub posterior_draft: std::collections::BTreeMap<i64, u8>,
 }
 
 impl GameState {
@@ -140,7 +142,7 @@ impl GameState {
             pending_events: Vec::new(),
             timers: None,
             joined,
-            posterior_draft: Vec::new(),
+            posterior_draft: std::collections::BTreeMap::new(),
         }
     }
 
@@ -166,24 +168,54 @@ impl GameState {
         }
     }
 
-    /// Start counting thinking time for players who still need to act.
-    /// Players already thinking keep their interval.
+    /// Start counting thinking time for players who are *currently* expected
+    /// to act. Crucially, this is called whenever a new player becomes the
+    /// active thinker so the previous player's `thinking_since` doesn't bleed
+    /// into the next player's think budget.
+    ///
+    /// `needs_act` is interpreted per phase:
+    ///   - `PriorPrediction`: only `current_player` (everyone else is waiting)
+    ///   - `Play`: every player who hasn't committed yet (simultaneous decisions)
+    ///   - `PosteriorPrediction`: only `start_player` (others are read-only)
+    ///   - `WaitingAll` / `End`: nobody
+    ///
+    /// Sets `thinking_since = now` for active players (overwriting any stale
+    /// value — the previous version only set it if `is_none()`, which made
+    /// the wait time before the next player's turn get incorrectly attributed
+    /// to them). Clears `thinking_since` for inactive players.
     pub fn start_thinking(&mut self) {
         let now = std::time::Instant::now();
         for (seat, p) in self.players.iter_mut().enumerate() {
+            let is_current = Some(seat) == self.current_player;
             let needs_act = match self.phase {
                 Phase::WaitingAll | Phase::End => false,
-                Phase::PriorPrediction => !p.has_predicted,
+                Phase::PriorPrediction => is_current && !p.has_predicted,
                 Phase::Play => p.committed_card.is_none(),
                 Phase::PosteriorPrediction => seat == self.start_player && p.posterior_prediction.is_none(),
             };
-            if needs_act && p.thinking_since.is_none() {
+            if needs_act {
                 p.thinking_since = Some(now);
-            }
-            if !needs_act {
+            } else {
                 p.thinking_since = None;
             }
         }
+        let active_uids: Vec<i64> = self.players.iter().enumerate()
+            .filter(|(_, p)| p.thinking_since.is_some())
+            .map(|(i, _)| self.players[i].uid)
+            .collect();
+        let phase_name = match self.phase {
+            Phase::WaitingAll => "waiting_all",
+            Phase::PriorPrediction => "prior_prediction",
+            Phase::Play => "play",
+            Phase::PosteriorPrediction => "posterior_prediction",
+            Phase::End => "ended",
+        };
+        game_sdk::game_log!(
+            debug, "start_thinking",
+            phase = phase_name,
+            round = self.round,
+            active_players = active_uids,
+        );
     }
 
     /// Elapsed ms while thinking for a player (0 if not thinking).
@@ -359,5 +391,99 @@ impl GameState {
             self.players.iter().map(|p| (p.uid, p.score)).collect();
         final_scores.sort_by(|a, b| b.1.cmp(&a.1));
         Event::GameEnded { final_scores }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rules::build_players;
+
+    fn make_state() -> GameState {
+        let uids = vec![1, 2, 3, 4, 5];
+        let mut s = GameState::new(build_players(&uids));
+        s.timers = Some(StepTimers::from_preset(Some("300+0")));
+        s.apply_timer_config();
+        s.phase = Phase::PriorPrediction;
+        s.current_player = Some(0);
+        s
+    }
+
+    #[test]
+    fn start_thinking_only_marks_current_player() {
+        // In PriorPrediction, only `current_player` (seat 0) should be
+        // marked as thinking. The other 4 players must have thinking_since
+        // = None so their wait time isn't counted toward their budget.
+        let mut s = make_state();
+        s.start_thinking();
+        for (seat, p) in s.players.iter().enumerate() {
+            if seat == 0 {
+                assert!(p.thinking_since.is_some(),
+                    "seat {seat} should be thinking after start_thinking");
+            } else {
+                assert!(p.thinking_since.is_none(),
+                    "seat {seat} should NOT be thinking (only current_player should)");
+            }
+        }
+    }
+
+    #[test]
+    fn start_thinking_resets_stale_clock_on_next_player() {
+        // Reproduce the previous bug: if start_thinking was called once
+        // for all `needs_act` players (the buggy version), then the next
+        // player's `thinking_since` is still T0 when they begin their turn.
+        // After the fix, advance_phase() calls start_thinking() which
+        // resets the active player's clock to now.
+        let mut s = make_state();
+        // First call: seat 0 starts thinking.
+        s.start_thinking();
+        let t0 = s.players[0].thinking_since.expect("seat 0 thinking");
+        // Player 0 commits → settle_action clears thinking_since.
+        let _ = s.apply_predict(1, Some(1));
+        s.settle_action(0);
+        assert!(s.players[0].thinking_since.is_none());
+        // Advance to next player.
+        s.current_player = Some(1);
+        s.start_thinking();
+        let t1 = s.players[1].thinking_since.expect("seat 1 thinking");
+        // The new clock must be strictly after t0 — proving the wait
+        // time before player 1's turn is not attributed to them.
+        assert!(t1 > t0, "player 1's clock should be reset, not reused");
+    }
+
+    #[test]
+    fn play_phase_marks_all_uncommitted_players_thinking() {
+        // In Play, all 5 think simultaneously. None has committed yet.
+        let mut s = make_state();
+        s.phase = Phase::Play;
+        s.current_player = None;
+        s.start_thinking();
+        for p in &s.players {
+            assert!(p.thinking_since.is_some(),
+                "every player should be thinking during Play");
+        }
+        // Player 0 commits.
+        let _ = s.apply_play_card(0, 0);
+        s.settle_action(0);
+        // After settle_action, player 0's clock is cleared; others keep theirs.
+        assert!(s.players[0].thinking_since.is_none());
+        for (seat, p) in s.players.iter().enumerate().skip(1) {
+            assert!(p.thinking_since.is_some(),
+                "seat {seat} should still be thinking in Play");
+        }
+    }
+
+    #[test]
+    fn start_thinking_clears_inactive_players() {
+        // After a player commits, their thinking_since must be None so
+        // before the next round starts, settle_action doesn't over-charge.
+        let mut s = make_state();
+        s.start_thinking();
+        let _ = s.apply_predict(1, Some(1));
+        s.settle_action(0);
+        // current_player still points at seat 0 until advance_phase runs.
+        // start_thinking again should NOT touch seat 0's already-None clock.
+        s.start_thinking();
+        assert!(s.players[0].thinking_since.is_none());
     }
 }

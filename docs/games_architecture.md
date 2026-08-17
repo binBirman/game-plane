@@ -273,6 +273,10 @@ SDK / Lobby **不变**。游戏之间不互相影响。
 - `protocol::LobbyInit` 加 `config: Option<Value>` 字段
 - `crates/lobby/src/games/registry.rs`：TOML 注册表加载（`LOBBY_GAMES_TOML`），未配置时回退为单 binary（tictactoe）
 - `GET /api/games` 端点返回注册表中 `enabled=true` 的游戏
+
+**日志协议**：
+
+游戏进程与 lobby 之间的日志走 [Game Log Protocol](game_log_protocol.md)：游戏通过 `game_sdk::game_log!` 向 stderr 写 JSON Lines，lobby 解析后用 `tracing` 重新发射，保留 `level` / `target` / `fields`。**stdout 留给 `GameEvent` JSON，不要写日志**。详见 `docs/game_log_protocol.md`。
 - `POST /api/rooms` 接受 `variant` / `config` 字段，写入 `rooms.variant` / `rooms.config`，`start` 时透传到 `LobbyInit.config`
 - `packaging/games.toml` 默认注册 tictactoe
 - `tools/ws_client.py`：Python 实现的 RFC 6455 WS 客户端（无外部依赖）

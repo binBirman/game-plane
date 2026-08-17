@@ -295,6 +295,50 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 }
 .modal .final-board .cell.x { color: var(--accent); }
 .modal .final-board .cell.o { color: var(--warn); }
+
+/* TYP: vertical ranked player list inside the game-over modal. */
+.modal .final-board.final-rank-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    width: 260px;
+    margin: 0 auto 20px;
+}
+.modal .final-board.final-rank-list .final-rank-row {
+    aspect-ratio: auto;
+    display: grid;
+    grid-template-columns: 28px 1fr auto;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 10px;
+    background: var(--card-2);
+    border-radius: 6px;
+    font-size: 15px;
+    font-weight: 500;
+    text-align: left;
+}
+.modal .final-board.final-rank-list .final-rank-num {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: #1a1300;
+    font-weight: 700;
+    font-size: 13px;
+}
+.modal .final-board.final-rank-list .final-rank-name {
+    font-weight: 600;
+}
+.modal .final-board.final-rank-list .final-rank-score {
+    color: var(--muted);
+    font-weight: 500;
+}
+.modal .final-board.final-rank-list .final-rank-me {
+    outline: 2px solid var(--accent);
+}
 .modal-actions {
     display: flex;
     gap: 8px;
@@ -757,6 +801,7 @@ button.confirm:hover { background: #ef4444; }
     top: 50%;
     left: 50%;
     transform: translate(-50%, -50%);
+    z-index: 1100;
     background: var(--card);
     border: 1px solid var(--border);
     border-radius: 12px;
@@ -925,6 +970,20 @@ button.confirm:hover { background: #ef4444; }
 .seat-predictions .posterior.committed {
     color: #facc15;  /* yellow */
     background: rgba(250, 204, 21, 0.08);
+}
+.seat-predictions .posterior.committed.flash {
+    /* 3-second highlight on the first commit per round: pulse the
+       yellow background and outline. The animation fades back to the
+       normal committed colour at the end so the cell stays readable. */
+    animation: posterior-flash 3s ease-out 1;
+    background: rgba(250, 204, 21, 0.28);
+    outline: 2px solid #facc15;
+    outline-offset: 1px;
+}
+@keyframes posterior-flash {
+    0%   { background: rgba(250, 204, 21, 0.65); outline-color: #facc15; transform: scale(1.04); }
+    60%  { background: rgba(250, 204, 21, 0.22); outline-color: #facc15; transform: scale(1.0); }
+    100% { background: rgba(250, 204, 21, 0.08); outline-color: rgba(250, 204, 21, 0); transform: scale(1.0); }
 }
 .seat-predictions .label {
     color: var(--muted);
@@ -1133,4 +1192,70 @@ button.confirm:hover { background: #ef4444; }
     background: var(--warn);
     color: #1a1300;
     border-color: var(--warn);
+}
+
+/* ─── posterior reveal (3-second overlay after the first player commits) ── */
+.posterior-reveal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.55);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+    animation: posterior-reveal-fade-in 0.18s ease-out;
+}
+.posterior-reveal {
+    background: var(--card, #1e293b);
+    border: 1px solid var(--border, #334155);
+    border-radius: 12px;
+    padding: 28px 36px;
+    min-width: 280px;
+    box-shadow: 0 16px 48px rgba(0, 0, 0, 0.45);
+    color: var(--fg, #f1f5f9);
+}
+.posterior-reveal-title {
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--accent, #facc15);
+    text-align: center;
+    margin-bottom: 14px;
+}
+.posterior-reveal-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.posterior-reveal-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 15px;
+}
+.posterior-reveal-item .rank-num {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    background: var(--accent, #facc15);
+    color: #1a1300;
+    font-weight: 700;
+}
+.posterior-reveal-item .rank-name {
+    font-weight: 600;
+}
+.posterior-reveal-hint {
+    margin-top: 16px;
+    text-align: center;
+    font-size: 12px;
+    color: var(--muted, #94a3b8);
+}
+@keyframes posterior-reveal-fade-in {
+    from { opacity: 0; transform: scale(0.96); }
+    to   { opacity: 1; transform: scale(1); }
 }

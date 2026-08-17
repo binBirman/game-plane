@@ -4,6 +4,20 @@ use crate::card::Card;
 use crate::event::Event;
 use crate::state::{GameState, Phase, PlayerState};
 
+fn phase_str(p: Phase) -> &'static str { p.name() }
+
+fn err_kind(e: &RuleError) -> &'static str {
+    match e {
+        RuleError::NotYourTurn { .. } => "NotYourTurn",
+        RuleError::WrongPhase { .. } => "WrongPhase",
+        RuleError::OutOfRange => "OutOfRange",
+        RuleError::Unknown => "Unknown",
+        RuleError::NotFirstPlayer => "NotFirstPlayer",
+        RuleError::AlreadyActed => "AlreadyActed",
+        RuleError::NotEnoughPlayers => "NotEnoughPlayers",
+    }
+}
+
 /// Errors surfaced to the offending client as `game_error`.
 #[derive(Debug)]
 pub enum RuleError {
@@ -81,74 +95,193 @@ impl GameState {
     /// Apply a posterior prediction. Must be either empty (skip) or a full
     /// ranking of all 5 player uids in best→worst order. Locked once set.
     pub fn apply_posterior(&mut self, uid: i64, mut rank_list: Vec<i64>) -> Result<Vec<Event>, RuleError> {
+        let phase_before = phase_str(self.phase);
+        let seat = self.seat_of(uid);
+        let start_player = self.players.get(self.start_player).map(|p| p.uid);
+        let (n, start_player) = match (self.players.len(), start_player) {
+            (n, Some(sp)) => (n, sp),
+            (_, None) => {
+                game_sdk::game_log!(warn, "apply_posterior: no start_player", uid = uid, phase = phase_before);
+                return Err(RuleError::WrongPhase { expected: "posterior_prediction", got: phase_before });
+            }
+        };
+
         if self.phase != Phase::PosteriorPrediction {
-            return Err(RuleError::WrongPhase { expected: "posterior_prediction", got: self.phase.name() });
+            let err = RuleError::WrongPhase { expected: "posterior_prediction", got: phase_before };
+            game_sdk::game_log!(
+                warn, "apply_posterior rejected: wrong phase",
+                uid = uid, phase = phase_before,
+                rank_count = rank_list.len(),
+                kind = err_kind(&err),
+            );
+            return Err(err);
         }
-        let seat = self.seat_of(uid).ok_or(RuleError::Unknown)?;
+        let seat = seat.ok_or_else(|| {
+            game_sdk::game_log!(warn, "apply_posterior rejected: unknown uid", uid = uid);
+            RuleError::Unknown
+        })?;
         if seat != self.start_player {
-            return Err(RuleError::NotFirstPlayer);
+            let err = RuleError::NotFirstPlayer;
+            game_sdk::game_log!(
+                warn, "apply_posterior rejected: not first player",
+                uid = uid, start_player = start_player,
+                kind = err_kind(&err),
+            );
+            return Err(err);
         }
         // Lock
         if self.players[seat].posterior_prediction.is_some() {
-            return Err(RuleError::AlreadyActed);
+            let err = RuleError::AlreadyActed;
+            game_sdk::game_log!(
+                warn, "apply_posterior rejected: already committed",
+                uid = uid, kind = err_kind(&err),
+            );
+            return Err(err);
         }
-        let n = self.players.len();
         // Empty = skip. Otherwise must contain exactly all n uids, no duplicates.
         if rank_list.is_empty() {
             self.players[seat].posterior_prediction = Some(Vec::new());
+            game_sdk::game_log!(
+                info, "apply_posterior accepted (skip)",
+                uid = uid, rank_count = 0,
+            );
             return Ok(vec![Event::PosteriorPredictionAccepted { uid }]);
         }
         if rank_list.len() != n {
-            return Err(RuleError::OutOfRange);
+            let err = RuleError::OutOfRange;
+            game_sdk::game_log!(
+                warn, "apply_posterior rejected: rank_list length",
+                uid = uid, rank_count = rank_list.len(), expected = n,
+                kind = err_kind(&err),
+            );
+            return Err(err);
         }
         let mut seen = vec![false; n];
         for &u in &rank_list {
-            let s = self.seat_of(u).ok_or(RuleError::OutOfRange)?;
-            if seen[s] { return Err(RuleError::OutOfRange); }
+            let s = self.seat_of(u).ok_or_else(|| {
+                game_sdk::game_log!(
+                    warn, "apply_posterior rejected: unknown uid in rank_list",
+                    uid = uid, bad_uid = u,
+                );
+                RuleError::OutOfRange
+            })?;
+            if seen[s] {
+                game_sdk::game_log!(
+                    warn, "apply_posterior rejected: duplicate",
+                    uid = uid, duplicate = u, seat = s,
+                );
+                return Err(RuleError::OutOfRange);
+            }
             seen[s] = true;
         }
         // All seats must appear
         if seen.iter().any(|&x| !x) {
+            game_sdk::game_log!(
+                warn, "apply_posterior rejected: missing seats",
+                uid = uid,
+            );
             return Err(RuleError::OutOfRange);
         }
         // No further mutation needed — store as-is
         rank_list.shrink_to_fit();
+        let stored: Vec<i64> = rank_list.clone();
         self.players[seat].posterior_prediction = Some(rank_list);
+        game_sdk::game_log!(
+            info, "apply_posterior accepted",
+            uid = uid, rank_count = stored.len(),
+            ranks = stored,
+        );
         Ok(vec![Event::PosteriorPredictionAccepted { uid }])
     }
 
-    /// Live-editable posterior draft (best→worst uids). Unlike
+    /// Live-editable posterior draft: `{ uid → rank }`. Unlike
     /// `apply_posterior`, this does NOT commit or lock — it only updates the
     /// shared draft so everyone sees the first player's in-progress selection.
     /// The first player can keep editing; nothing counts until `apply_posterior`.
-    pub fn apply_posterior_draft(&mut self, uid: i64, rank_list: Vec<i64>) -> Result<Vec<Event>, RuleError> {
+    ///
+    /// The frontend sends a dict so the first player can freely pin any
+    /// player to any rank in any order — the only invariant we enforce here
+    /// is: every uid in the dict exists, every rank is in `1..=n`, and no
+    /// two uids share a rank. Length == n is required only at commit time
+    /// (`apply_posterior`), not here.
+    pub fn apply_posterior_draft(
+        &mut self,
+        uid: i64,
+        assignments: std::collections::BTreeMap<i64, u8>,
+    ) -> Result<Vec<Event>, RuleError> {
+        let phase_before = phase_str(self.phase);
         if self.phase != Phase::PosteriorPrediction {
-            return Err(RuleError::WrongPhase { expected: "posterior_prediction", got: self.phase.name() });
+            let err = RuleError::WrongPhase { expected: "posterior_prediction", got: phase_before };
+            game_sdk::game_log!(
+                warn, "apply_posterior_draft rejected: wrong phase",
+                uid = uid, phase = phase_before,
+                entry_count = assignments.len(),
+                kind = err_kind(&err),
+            );
+            return Err(err);
         }
-        let seat = self.seat_of(uid).ok_or(RuleError::Unknown)?;
+        let seat = self.seat_of(uid).ok_or_else(|| {
+            game_sdk::game_log!(warn, "apply_posterior_draft rejected: unknown uid", uid = uid);
+            RuleError::Unknown
+        })?;
         if seat != self.start_player {
-            return Err(RuleError::NotFirstPlayer);
+            let err = RuleError::NotFirstPlayer;
+            game_sdk::game_log!(
+                warn, "apply_posterior_draft rejected: not first player",
+                uid = uid, expected_seat = self.start_player, actual_seat = seat,
+                kind = err_kind(&err),
+            );
+            return Err(err);
         }
         // If already committed, ignore further edits.
         if self.players[seat].posterior_prediction.is_some() {
-            return Err(RuleError::AlreadyActed);
+            let err = RuleError::AlreadyActed;
+            game_sdk::game_log!(
+                warn, "apply_posterior_draft rejected: already committed",
+                uid = uid, kind = err_kind(&err),
+            );
+            return Err(err);
         }
         let n = self.players.len();
-        if !rank_list.is_empty() {
-            if rank_list.len() != n {
-                return Err(RuleError::OutOfRange);
+        let mut seen_rank = vec![false; n + 1]; // index by rank (1..=n)
+        for (&u, &r) in &assignments {
+            if self.seat_of(u).is_none() {
+                let err = RuleError::OutOfRange;
+                game_sdk::game_log!(
+                    warn, "apply_posterior_draft rejected: unknown uid",
+                    uid = uid, bad_uid = u,
+                    kind = err_kind(&err),
+                );
+                return Err(err);
             }
-            let mut seen = vec![false; n];
-            for &u in &rank_list {
-                let s = self.seat_of(u).ok_or(RuleError::OutOfRange)?;
-                if seen[s] { return Err(RuleError::OutOfRange); }
-                seen[s] = true;
+            if r == 0 || r as usize > n {
+                let err = RuleError::OutOfRange;
+                game_sdk::game_log!(
+                    warn, "apply_posterior_draft rejected: rank out of range",
+                    uid = uid, bad_uid = u, bad_rank = r,
+                    kind = err_kind(&err),
+                );
+                return Err(err);
             }
-            if seen.iter().any(|&x| !x) {
-                return Err(RuleError::OutOfRange);
+            if seen_rank[r as usize] {
+                let err = RuleError::OutOfRange;
+                game_sdk::game_log!(
+                    warn, "apply_posterior_draft rejected: duplicate rank",
+                    uid = uid, duplicate = u, rank = r,
+                    kind = err_kind(&err),
+                );
+                return Err(err);
             }
+            seen_rank[r as usize] = true;
         }
-        self.posterior_draft = rank_list;
+        self.posterior_draft = assignments;
+        let entry_count = self.posterior_draft.len();
+        let players_with_rank: Vec<i64> = self.posterior_draft.keys().copied().collect();
+        game_sdk::game_log!(
+            debug, "apply_posterior_draft accepted",
+            uid = uid, entry_count = entry_count,
+            players = players_with_rank,
+        );
         Ok(vec![])
     }
 

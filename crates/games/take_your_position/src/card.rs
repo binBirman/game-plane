@@ -128,10 +128,47 @@ impl Card {
 }
 
 fn suit_value(s: Suit) -> u8 {
+    // Standard Chinese card suit ranking when ranks are equal:
+    // spade (黑桃) > heart (红桃) > club (梅花) > diamond (方块).
     match s {
         Suit::Spade => 4,
         Suit::Heart => 3,
-        Suit::Diamond => 2,
-        Suit::Club => 1,
+        Suit::Club => 2,
+        Suit::Diamond => 1,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn suit_ranking_is_spade_heart_club_diamond() {
+        // 黑桃 > 红桃 > 梅花 > 方块 (spade > heart > club > diamond).
+        let order = [Suit::Spade, Suit::Heart, Suit::Club, Suit::Diamond];
+        for w in order.windows(2) {
+            let a = suit_value(w[0]);
+            let b = suit_value(w[1]);
+            assert!(a > b, "{:?} ({}) should rank higher than {:?} ({})", w[0], a, w[1], b);
+        }
+    }
+
+    #[test]
+    fn cmp_table_same_rank_uses_suit_order() {
+        let ace = Card { rank: Rank::A, suit: Suit::Spade };
+        let table = vec![ace];
+        let make = |suit| Card { rank: Rank::A, suit };
+        let spade = make(Suit::Spade);
+        let heart = make(Suit::Heart);
+        let club = make(Suit::Club);
+        let diamond = make(Suit::Diamond);
+        // Symmetric cmp: >=.
+        assert_eq!(spade.cmp_table(&heart, &table), std::cmp::Ordering::Greater);
+        assert_eq!(heart.cmp_table(&spade, &table), std::cmp::Ordering::Less);
+        assert_eq!(heart.cmp_table(&club, &table), std::cmp::Ordering::Greater);
+        assert_eq!(club.cmp_table(&heart, &table), std::cmp::Ordering::Less);
+        assert_eq!(club.cmp_table(&diamond, &table), std::cmp::Ordering::Greater);
+        assert_eq!(diamond.cmp_table(&club, &table), std::cmp::Ordering::Less);
+    }
+}
+

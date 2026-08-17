@@ -287,7 +287,7 @@ Auth: Bearer <token>
 ### 2.2 进程线协议（Lobby ↔ Game）
 
 - 通道：stdin / stdout，UTF-8，每行一个 JSON 对象（`\n` 结尾）。
-- stderr 仅供日志，不参与协议。
+- stderr 走独立的 [Game Log Protocol](game_log_protocol.md)：游戏进程写 JSON Lines，lobby 解析后用 `tracing` 重新发射。**不要**在 stderr 写非 JSON 文本（lobby 会丢）；**不要**在 stdout 写日志（会和 `GameEvent` 协议冲突）。
 
 #### 2.2.1 初始化（stdin 首行）
 
